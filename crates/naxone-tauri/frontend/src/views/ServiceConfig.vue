@@ -160,18 +160,11 @@ const phpExts = ref<PhpExtension[]>([]);
 const phpIni = ref<PhpIniSettings | null>(null);
 const phpSubTab = ref<"extensions" | "settings" | "phpinfo">("extensions");
 
-// phpinfo
-const phpinfoText = ref<string>("");
+// phpinfo（HTML 模式，iframe srcdoc 隔离渲染）
+const phpinfoHtml = ref<string>("");
+const phpinfoFileUrl = ref<string>("");
+const phpinfoError = ref<string>("");
 const phpinfoLoading = ref(false);
-const phpinfoSearch = ref("");
-const phpinfoFiltered = computed(() => {
-  const q = phpinfoSearch.value.trim().toLowerCase();
-  if (!q) return phpinfoText.value;
-  return phpinfoText.value
-    .split(/\r?\n/)
-    .filter((line) => line.toLowerCase().includes(q))
-    .join("\n");
-});
 
 async function loadPhpInstances() {
   try {
@@ -200,22 +193,37 @@ async function savePhpIni() {
 async function loadPhpInfo() {
   if (!selectedPhp.value || phpinfoLoading.value) return;
   phpinfoLoading.value = true;
-  phpinfoText.value = "";
+  phpinfoError.value = "";
+  phpinfoHtml.value = "";
+  phpinfoFileUrl.value = "";
   try {
-    phpinfoText.value = await invoke<string>("get_phpinfo", { installPath: selectedPhp.value.install_path });
+    const res = await invoke<{ html: string; file_url: string }>("get_phpinfo_html", {
+      installPath: selectedPhp.value.install_path,
+    });
+    phpinfoHtml.value = res.html;
+    phpinfoFileUrl.value = res.file_url;
   } catch (e) {
-    phpinfoText.value = `加载 phpinfo 失败：${e}`;
+    phpinfoError.value = String(e);
   } finally { phpinfoLoading.value = false; }
+}
+async function openPhpInfoInBrowser() {
+  if (!phpinfoFileUrl.value) return;
+  try { await invoke("open_in_browser", { url: phpinfoFileUrl.value }); }
+  catch (e) { showError(`打开浏览器失败: ${e}`); }
 }
 function switchPhpSubTab(t: typeof phpSubTab.value) {
   phpSubTab.value = t;
-  if (t === "phpinfo" && !phpinfoText.value) loadPhpInfo();
+  if (t === "phpinfo" && !phpinfoHtml.value && !phpinfoError.value) loadPhpInfo();
 }
 
 watch(selectedPhp, () => {
   loadPhpExts();
   loadPhpIni();
-  phpinfoText.value = ""; // 切换实例后清缓存，下次进 phpinfo tab 才重新拉
+  phpinfoHtml.value = "";
+  phpinfoFileUrl.value = "";
+  phpinfoError.value = "";
+  // 当前正在 phpinfo tab 时切换版本要立刻刷新，否则只在下次进 tab 时拉取
+  if (phpSubTab.value === "phpinfo") loadPhpInfo();
 });
 
 // ─── PIE 扩展安装 ───────────────────────────────────
@@ -642,26 +650,26 @@ onMounted(() => {
       <!-- phpinfo -->
       <div v-if="phpSubTab === 'phpinfo'">
         <div class="flex items-center gap-2 mb-3">
-          <input
-            class="input flex-1"
-            v-model="phpinfoSearch"
-            placeholder="搜索 phpinfo（按行过滤，如 openssl / mysqli / date.timezone）"
-          />
+          <div class="flex-1 text-[12px]" style="color: var(--text-muted)">
+            源：<code>{{ selectedPhp?.install_path || '' }}\php-cgi.exe -q -i</code>
+          </div>
+          <button class="btn btn-secondary btn-sm" :disabled="!phpinfoFileUrl" @click="openPhpInfoInBrowser">
+            在浏览器打开
+          </button>
           <button class="btn btn-secondary btn-sm" :disabled="phpinfoLoading" @click="loadPhpInfo">
             {{ phpinfoLoading ? '加载中...' : '刷新' }}
           </button>
         </div>
-        <div class="text-[12px] mb-2" style="color: var(--text-muted)">
-          源：<code>{{ selectedPhp?.install_path || '' }}\php.exe -i</code>
-          <span v-if="phpinfoSearch.trim()" class="ml-2">·
-            匹配 {{ phpinfoFiltered.split('\n').length }} 行 /
-            共 {{ phpinfoText.split('\n').length }} 行
-          </span>
-        </div>
-        <pre
-          class="font-mono text-[12px] leading-[1.5] p-3 rounded-md overflow-auto"
-          style="background: var(--bg-tertiary); color: var(--text-primary); max-height: 70vh; white-space: pre-wrap; word-break: break-all"
-        >{{ phpinfoLoading ? '正在跑 php -i ...' : (phpinfoFiltered || '（没有匹配的行）') }}</pre>
+
+        <div v-if="phpinfoLoading" class="text-[12px] p-3" style="color: var(--text-muted)">正在跑 php -r "phpinfo();" ...</div>
+        <div v-else-if="phpinfoError" class="text-[12px] p-3" style="color: var(--danger)">{{ phpinfoError }}</div>
+        <iframe
+          v-else-if="phpinfoHtml"
+          class="w-full"
+          style="height: 72vh; border: 1px solid var(--border); border-radius: 6px; background: #fff"
+          sandbox="allow-same-origin"
+          :srcdoc="phpinfoHtml"
+        ></iframe>
       </div>
     </div>
 
@@ -824,4 +832,3 @@ onMounted(() => {
     </div>
   </div>
 </template>
-

@@ -78,6 +78,7 @@ fn main() {
             commands::php::get_php_ini_settings,
             commands::php::save_php_ini_settings,
             commands::php::get_phpinfo,
+            commands::php::get_phpinfo_html,
             commands::php::get_global_php_version,
             commands::php::set_global_php_version,
             commands::php::fix_global_php_conflicts,

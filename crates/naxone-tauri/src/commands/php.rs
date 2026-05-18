@@ -129,6 +129,78 @@ pub async fn get_phpinfo(install_path: String) -> Result<String, String> {
     Ok(combined)
 }
 
+// ==================== HTML phpinfo ====================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PhpInfoHtml {
+    /// phpinfo() 完整 HTML（含官方默认 <style> 块）。前端用 <iframe srcdoc> 隔离渲染。
+    pub html: String,
+    /// 同步写到 %TEMP% 的副本，给「在浏览器打开」按钮用。形如 file:///C:/.../naxone-phpinfo-XXXX.html
+    pub file_url: String,
+}
+
+/// 用 `php-cgi.exe -q -r 'phpinfo();'` 拿官方 HTML 版 phpinfo。
+/// 必须走 CGI SAPI —— CLI SAPI 的 phpinfo() 是纯文本输出，没有表格。
+/// 同时把结果写到 %TEMP%，返回 file:// URL 供「在浏览器打开」按钮用。
+#[tauri::command]
+pub async fn get_phpinfo_html(install_path: String) -> Result<PhpInfoHtml, String> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::process::Command;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+
+    let install = std::path::PathBuf::from(&install_path);
+    let cgi_exe = install.join("php-cgi.exe");
+    if !cgi_exe.is_file() {
+        return Err(format!(
+            "php-cgi.exe 不存在: {}（HTML 版 phpinfo 必须走 CGI SAPI）",
+            cgi_exe.display()
+        ));
+    }
+    let ini = ["php.ini", "php.ini-production", "php.ini-development"]
+        .iter()
+        .map(|n| install.join(n))
+        .find(|p| p.is_file());
+    let ext_dir = install.join("ext");
+
+    let mut cmd = Command::new(&cgi_exe);
+    cmd.arg("-q"); // suppress HTTP headers, 输出纯 HTML
+    if let Some(ini_path) = &ini {
+        cmd.arg("-c").arg(ini_path);
+    }
+    if ext_dir.is_dir() {
+        cmd.arg("-d").arg(format!("extension_dir={}", ext_dir.display()));
+    }
+    cmd.arg("-i"); // -i = phpinfo()，CGI SAPI 下走 HTML 分支
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| format!("启动 php-cgi.exe 失败: {}", e))?;
+    let mut html = String::from_utf8_lossy(&out.stdout).to_string();
+
+    // -q 已经吃掉 HTTP 头，但有些 build（特别是带扩展加载警告时）头还会残留。
+    // 保险起见：如果 stdout 不是 <!DOCTYPE 起头，且能找到第一个 "<!DOCTYPE" 或 "<html"，从那里截。
+    let lower = html.to_ascii_lowercase();
+    if !lower.trim_start().starts_with("<!doctype") && !lower.trim_start().starts_with("<html") {
+        if let Some(idx) = lower.find("<!doctype").or_else(|| lower.find("<html")) {
+            html = html[idx..].to_string();
+        }
+    }
+
+    let mut hasher = DefaultHasher::new();
+    install_path.hash(&mut hasher);
+    let temp_file = std::env::temp_dir().join(format!("naxone-phpinfo-{:x}.html", hasher.finish()));
+    std::fs::write(&temp_file, &html).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    let file_url = format!("file:///{}", temp_file.display().to_string().replace('\\', "/"));
+
+    Ok(PhpInfoHtml { html, file_url })
+}
+
 // ==================== 全局 PHP CLI 版本 ====================
 
 #[derive(Debug, Clone, Serialize)]
