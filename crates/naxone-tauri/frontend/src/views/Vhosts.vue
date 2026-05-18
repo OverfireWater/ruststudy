@@ -100,6 +100,10 @@ const templateMirrorOptions = [
 ];
 const templateMirrorPick = ref<string>(""); // 当前下拉选中的 URL（响应式）
 const templateCancelBusy = ref(false);
+// 用于 retry / 换镜像成功后做"自动调整 document_root 到入口子目录"的上下文。
+// doSaveVhost 在调用 runTemplateInit 前会塞这俩，applyTemplatePostInit 拿出来用。
+const templateLastVhostId = ref<string>("");
+const templateLastFormSnap = ref<FormData | null>(null);
 let templateTimer: ReturnType<typeof setInterval> | null = null;
 
 function phaseLabel(p: TemplateProgress | null, busy: boolean): string {
@@ -330,32 +334,49 @@ async function doSaveVhost() {
     showForm.value = false; editingId.value = null; editingSource.value = "";
     showSuccess(isEdit ? "站点更新成功，已自动 reload Web 服务器" : "站点创建成功，已自动 reload Web 服务器");
     if (templateToInit) {
+      // 保存装包上下文（retry / 换镜像 成功后也要走 applyTemplatePostInit）
+      templateLastVhostId.value = vhostId;
+      templateLastFormSnap.value = formSnap;
       const ok = await runTemplateInit(projectRoot, templateToInit);
-      if (!ok) return; // 模板失败：不再追加误导性的 webman/入口子目录提示
-      const subdir = entrySubdirForTemplate(templateToInit);
-      if (subdir) {
-        const newRoot = `${projectRoot}/${subdir}`.replace(/\\/g, "/").replace(/\/+/g, "/");
-        try {
-          vhosts.value = await invoke("update_vhost", {
-            id: vhostId,
-            req: { ...formSnap, document_root: newRoot },
-          });
-          showFloat(`已自动指向入口目录 ${subdir}/`);
-        } catch (e) {
-          showError(`自动设置入口目录失败，请手动改 nginx root: ${e}`);
-        }
-      }
-      // Webman 是常驻 cli 进程，nginx 仅做 proxy_pass，必须用户手动起
-      if (templateToInit === "webman") {
-        templateLogs.value.push("");
-        templateLogs.value.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        templateLogs.value.push("⚠ Webman 是常驻 cli 进程，需手动启动：");
-        templateLogs.value.push(`  cd ${projectRoot}`);
-        templateLogs.value.push("  双击 windows.bat 或运行 php windows.php");
-        templateLogs.value.push("启动后浏览器访问本站点即可（nginx 已配 proxy 到 :8787）");
+      if (ok) {
+        await applyTemplatePostInit();
       }
     }
   } catch (e) { showError("保存失败: " + e); } finally { busy.value = false; }
+}
+
+/// 装包成功后自动调整 document_root 到入口子目录（Laravel/ThinkPHP/Webman 用 /public）
+/// + 给 Webman 显示常驻进程启动提示。
+/// doSaveVhost、retryTemplate、onMirrorPicked 重试成功后都会调。
+async function applyTemplatePostInit() {
+  const vhostId = templateLastVhostId.value;
+  const tpl = templateLastTpl.value;
+  const formSnap = templateLastFormSnap.value;
+  const projectRoot = templateLastTarget.value;
+  if (!vhostId || !tpl || !formSnap) return;
+
+  const subdir = entrySubdirForTemplate(tpl);
+  if (subdir) {
+    const newRoot = `${projectRoot}/${subdir}`.replace(/\\/g, "/").replace(/\/+/g, "/");
+    try {
+      vhosts.value = await invoke("update_vhost", {
+        id: vhostId,
+        req: { ...formSnap, document_root: newRoot },
+      });
+      showFloat(`已自动指向入口目录 ${subdir}/`);
+    } catch (e) {
+      showError(`自动设置入口目录失败，请手动改 nginx root: ${e}`);
+    }
+  }
+  // Webman 是常驻 cli 进程，nginx 仅做 proxy_pass，必须用户手动起
+  if (tpl === "webman") {
+    templateLogs.value.push("");
+    templateLogs.value.push("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    templateLogs.value.push("⚠ Webman 是常驻 cli 进程，需手动启动：");
+    templateLogs.value.push(`  cd ${projectRoot}`);
+    templateLogs.value.push("  双击 windows.bat 或运行 php windows.php");
+    templateLogs.value.push("启动后浏览器访问本站点即可（nginx 已配 proxy 到 :8787）");
+  }
 }
 
 function copyTemplateLogs() {
@@ -399,7 +420,9 @@ async function retryTemplate() {
     showError(`清理失败残留失败: ${e}`);
     return;
   }
-  await runTemplateInit(templateLastTarget.value, templateLastTpl.value, prefix);
+  const ok = await runTemplateInit(templateLastTarget.value, templateLastTpl.value, prefix);
+  // 装包成功 → 走和 doSaveVhost 一致的"调整 document_root 到入口子目录"逻辑
+  if (ok) await applyTemplatePostInit();
 }
 
 /// 用户从下拉选了镜像 → 切换 + 自动重试
