@@ -385,7 +385,21 @@ async function cancelTemplate() {
 /// 重试：清空日志重新跑相同的 target + template
 async function retryTemplate() {
   if (templateBusy.value || !templateLastTarget.value || !templateLastTpl.value) return;
-  await runTemplateInit(templateLastTarget.value, templateLastTpl.value);
+  // 先清掉上次失败留下的残留（composer 写了一半的 vendor/composer.json 等），
+  // 否则 init_site_template 的目录非空校验会再次失败。
+  // 注：cleanup 日志通过 prefixLog 传给 runTemplateInit —— 因为后者入口会清空 templateLogs，
+  // 这里 push 也会被擦掉。
+  let prefix: string | undefined;
+  try {
+    const cleaned = await invoke<number>("cleanup_template_dir", {
+      targetDir: templateLastTarget.value,
+    });
+    if (cleaned > 0) prefix = `🧹 已清理 ${cleaned} 项失败残留`;
+  } catch (e) {
+    showError(`清理失败残留失败: ${e}`);
+    return;
+  }
+  await runTemplateInit(templateLastTarget.value, templateLastTpl.value, prefix);
 }
 
 /// 用户从下拉选了镜像 → 切换 + 自动重试
@@ -413,9 +427,14 @@ async function syncCurrentMirror() {
   }
 }
 
-async function runTemplateInit(targetDir: string, template: string): Promise<boolean> {
+async function runTemplateInit(
+  targetDir: string,
+  template: string,
+  prefixLog?: string, // 在清空日志后立即 push 这一条（重试时用来回显 cleanup 结果）
+): Promise<boolean> {
   showTemplateModal.value = true;
   templateLogs.value = [];
+  if (prefixLog) templateLogs.value.push(prefixLog);
   templateBusy.value = true;
   templateFailed.value = false;
   templateLastTarget.value = targetDir;

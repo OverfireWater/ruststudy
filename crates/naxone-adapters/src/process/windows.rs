@@ -649,10 +649,10 @@ impl ProcessManager for WindowsProcessManager {
     async fn reload(&self, instance: &ServiceInstance) -> Result<()> {
         match instance.kind {
             ServiceKind::Nginx => {
-                // 护栏：`nginx -s reload` 依赖 logs/nginx.pid 找到 master 进程发信号。
-                // pid 文件被截断成 0 字节时（master 异常死亡 / 多进程踩踏），nginx
-                // 会报 `invalid PID number ""` 这种迷惑错误。这里前置一个清楚的提示，
-                // 让用户去点【重启】而不是反复触发 reload。
+                // `nginx -s reload` 依赖 logs/nginx.pid 找到 master 进程发信号。
+                // pid 文件不存在 / 为空 / 0 字节时（master 异常死亡 / 多进程踩踏 / 多次重启
+                // 互相覆盖），nginx 会报 `invalid PID number ""`。自愈方案：先 stop（杀任何
+                // 残留 nginx 进程，释放端口），再 start（写新的 pid 文件），然后正常 reload。
                 let pid_file = instance.install_path.join("logs").join("nginx.pid");
                 let pid_ok = std::fs::read_to_string(&pid_file)
                     .ok()
@@ -660,10 +660,20 @@ impl ProcessManager for WindowsProcessManager {
                     .filter(|&p| p > 0)
                     .is_some();
                 if !pid_ok {
-                    return Err(NaxOneError::Process(format!(
-                        "Nginx 状态异常：{} 为空或无效。请先点 Nginx 卡片的【重启】让它干净拉起一次。",
-                        pid_file.display()
-                    )));
+                    tracing::warn!(
+                        pid_file = %pid_file.display(),
+                        "Nginx pid 文件无效，自愈：stop + start 后再 reload"
+                    );
+                    // 自愈：杀所有 nginx 残留 → 启动一次干净的
+                    let _ = self.stop(instance).await; // 即便 stop 失败也继续
+                    self.start(instance).await.map_err(|e| {
+                        NaxOneError::Process(format!(
+                            "Nginx pid 文件损坏，自动重启失败: {e}"
+                        ))
+                    })?;
+                    // start 成功后立即返回（不再 reload）—— 启动本身就加载了最新 conf
+                    tracing::info!("Nginx pid 文件无效，已通过自愈完成 reload 等效操作");
+                    return Ok(());
                 }
 
                 // First run -t to test config

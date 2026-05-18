@@ -546,3 +546,72 @@ async fn resolve_naxone_composer_phar(state: &State<'_, AppState>) -> Option<Pat
     }
     None
 }
+
+/// 清理目标目录里所有"非自家文件"，让重试 / 换镜像装包能通过空目录校验。
+///
+/// 保留白名单：`nginx.htaccess` + `.htaccess`（跟 `init_site_template` 入口校验白名单
+/// 保持一致 —— 清完后那边的 real_files 检查必然通过）。
+///
+/// 安全门禁：`target_dir` 必须等于**某个已存在 vhost 的 document_root**，否则拒绝清理。
+/// 即便前端被注入也无法删任意目录。
+///
+/// 返回清掉的顶层条目数（文件 + 子目录）。
+#[tauri::command]
+pub async fn cleanup_template_dir(
+    target_dir: String,
+    state: State<'_, AppState>,
+) -> Result<usize, String> {
+    let dir = PathBuf::from(&target_dir);
+    if !dir.is_absolute() {
+        return Err("target_dir 必须是绝对路径".into());
+    }
+    if !dir.is_dir() {
+        return Err(format!("目录不存在: {}", dir.display()));
+    }
+
+    // 安全门禁：target_dir 必须匹配某个 vhost 的 document_root
+    let norm_target = dir.to_string_lossy().replace('\\', "/").to_lowercase();
+    let allowed = {
+        let vhosts = state.vhosts.read().await;
+        vhosts.iter().any(|v| {
+            let r = v.document_root.to_string_lossy().replace('\\', "/").to_lowercase();
+            r == norm_target
+        })
+    };
+    if !allowed {
+        return Err("拒绝清理：路径不是任何 vhost 的站点目录".into());
+    }
+
+    let keep = ["nginx.htaccess", ".htaccess"];
+    let mut removed = 0usize;
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| format!("读取目录失败: {}", e))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if keep.iter().any(|k| *k == s.as_ref()) {
+            continue;
+        }
+        let p = entry.path();
+        let res = if p.is_dir() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        };
+        match res {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!("清理 {} 失败: {}", p.display(), e),
+        }
+    }
+
+    push_log(
+        &state,
+        LogLevel::Info,
+        "site-template",
+        format!("清理模板装包残留 {} 项 → {}", removed, dir.display()),
+        None,
+        None,
+    )
+    .await;
+    Ok(removed)
+}

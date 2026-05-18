@@ -45,3 +45,6 @@ naxone-updater.key
 # 但独立的 bundle 目录也防一手：
 /bundle/
 /AppImage/
+
+# playwright-mcp 临时缓存（CDP 会话快照、控制台日志等，不入仓库）
+.playwright-mcp/

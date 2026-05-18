@@ -18,6 +18,20 @@ fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hyper=warn,reqwest=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // WebView2 user data folder 隔离：dev 用 `<home>/webview2`，prod 用同一逻辑路径但 home
+    // 不同（dev=.naxone-dev，prod=.naxone）。这样：
+    // - dev 和 prod 完全不共享 webview cookies / localStorage / cache
+    // - dev 启动时不会撞 prod 已锁的 user data folder（之前的 HRESULT 0x8007139F）
+    // - admin 装的 prod 跟普通用户跑的 dev 互不打架
+    #[cfg(target_os = "windows")]
+    {
+        let dir = naxone_adapters::platform::dirs::naxone_home_dir().join("webview2");
+        let _ = std::fs::create_dir_all(&dir);
+        // SAFETY: main 顶层、单线程、tauri webview 创建之前，env 写入安全
+        unsafe { std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir); }
+        tracing::info!(path = %dir.display(), "WebView2 user data folder");
+    }
+
     let app_state = AppState::new();
 
     let builder = tauri::Builder::default()
@@ -125,6 +139,7 @@ fn main() {
             commands::vhost::write_vhost_conf,
             commands::template::init_site_template,
             commands::template::cancel_init_site_template,
+            commands::template::cleanup_template_dir,
         ])
         .setup(|app| {
             // Dev 模式窗口标题加标识
