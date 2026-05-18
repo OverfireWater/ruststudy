@@ -1,11 +1,11 @@
 {
-  "version": "v0.5.21",
-  "notes": "## NaxOne v0.5.21\n\n本次累计 5 个版本（v0.5.17 → v0.5.21）的稳定性 + 体验改善，重点在**模板装包**与 **phpinfo 面板**。建议升级。\n\n### ✨ 新增 / 改进\n\n- **phpinfo 改用 HTML 表格渲染**：服务配置 → PHP → phpinfo tab 现在跑 `php-cgi.exe -q -i` 拿官方紫绿条 HTML（之前是 `php -i` 一坨纯文本），用 `<iframe srcdoc>` 隔离渲染不污染主题；新增「在浏览器打开」按钮，方便放大/搜索；切换 PHP 版本时 phpinfo 自动刷新\n- **模板装包失败重试自动清残留**：装 Laravel / ThinkPHP / Webman 等模板时 composer 半路失败会留下 `vendor/` `composer.json` 等碎片，点「重试」或「换镜像」时 NaxOne 自动清理（仅清 vhost 自家 document_root 目录，路径门禁防误删）\n- **重试成功后自动调整入口目录**：Laravel/ThinkPHP/Webman 装成功后 nginx `document_root` 自动指向 `<project>/public`（之前只有首次成功会调，重试路径漏了）\n- **phpinfo 面板（v0.5.18）**：第一次把 phpinfo 集成到 NaxOne 内，无需手写 phpinfo.php\n- **启动检测坏 vhost**：启动时若发现 vhosts.json 元数据指向已不存在的 PHP / 目录，仪表板顶部红色横幅提示，避免 nginx reload 报 emerg 时一脸懵\n\n### 🔧 关键 Bug 修复\n\n- **dev/prod 完全隔离（v0.5.18）**：开发模式与正式安装版的数据目录、WebView2 用户数据、Extensions 路径全部分开，避免在开发 NaxOne 的同时正式版被坑（之前共用 `%APPDATA%/.naxone` 会互相覆盖配置）\n- **nginx 启动失败错误更友好**：保留 nginx `emerg:` 完整错误信息（如 `bind() to 0.0.0.0:80 failed (10013)`），不再只显示「启动失败」让用户摸黑排查\n- **nginx pid 文件自愈**：reload 时若 pid 文件丢失或进程已不在，自动 stop+start 而不是死循环\n- **WebView2 用户数据目录隔离**：dev 与 prod 用不同的 WebView2 user data folder，避免 admin 装的正式版锁住开发版（HRESULT 0x8007139F）\n- **模板装包可点「停止」**：modal 上新增「停止」按钮，能真正中断 composer 子进程而不只是关弹窗\n\n### 🚀 性能\n\n- **服务启停并行化（v0.5.18）**：多个 PHP-CGI 实例的 start/stop 用 `join_all` 并发，原来 4 个 PHP 串行 12s 现在并行 3s\n- **WM_SETTINGCHANGE 广播改 fire-and-forget**：写全局 PATH 后通知系统的调用从 3000ms 阻塞改成异步，UI 不再卡顿\n\n### 升级方式\n\n已在用 NaxOne 的，下次启动会自动收到更新提示。\n新装请下载附件 `NaxOne_0.5.21_x64-setup.exe` 双击安装。\n",
-  "pub_date": "2026-05-18T08:39:13Z",
+  "version": "v0.5.22",
+  "notes": "## NaxOne v0.5.22\n\n### 🔧 Bug 修复\n\n- **phpinfo 在 PHP 8 下显示空白**：`php-cgi.exe -i` 在 PHP 8 + Windows ASLR 下 OPcache 报 fatal \"Opcode handlers are unusable\" 后静默退出，phpinfo tab 一片空白。修复方式：调 php-cgi 时强制关 OPcache（`-d opcache.enable=0 -d opcache.enable_cli=0`，opcache 对查 phpinfo 没用处）\n- **phpinfo 失败不再静默**：php-cgi 没有输出 HTML 时直接把 stdout/stderr/exit code 报给前端，便于诊断\n\n### 升级方式\n\n已在用 NaxOne 的，下次启动会自动收到更新提示。\n新装请下载附件 `NaxOne_0.5.22_x64-setup.exe` 双击安装。\n",
+  "pub_date": "2026-05-18T09:04:57Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjdsVkhUWjBaeFJRL2dXaThoalpTYjFFQnlqc2gvM0FVdkJVMWIvekN0Y0h6VnFxbmYrUHlRM0JQL1BPUEorTngrY29BYzhpdzN2YmlaR202Z01ia3dRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MDkzNTUzCWZpbGU6TmF4T25lXzAuNS4yMV94NjQtc2V0dXAuZXhlCnBINS9CczNQdlRzQTRDbG91amRYRlBkc3pINkREVzVnc1NPMjFZUXV4WHJMU0xFaHRNam1xTDhnVG01cnpaV1k4dzJFSHl5RDlGdWs2WlBVaWRBaEJBPT0K",
-      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.21/NaxOne_0.5.21_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjlGKy8xZkJ0TUthN2tPR0dydW5lRUdGdVNtcHdSVUNYY0dSaitibTE1ZHE4UEdvT3V6SUFkaGNtV2lzQWFGTmhWT3VWZkp6YlhtMzJlMmQ0ZXlveWdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MDk1MDk3CWZpbGU6TmF4T25lXzAuNS4yMl94NjQtc2V0dXAuZXhlCnMvRWtraHBRMjdWWmFYc203SlppV01WZjNRdWR3QzhzcmFvSUxGQW54OHgyTTJzZ3RNTU42eXdHN1p4eFdvaTZ3eTFCYUtQYjYwMzNBdkgwQU44QURBPT0K",
+      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.22/NaxOne_0.5.22_x64-setup.exe"
     }
   }
 }
