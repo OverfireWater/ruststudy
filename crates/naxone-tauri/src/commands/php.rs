@@ -172,6 +172,10 @@ pub async fn get_phpinfo_html(install_path: String) -> Result<PhpInfoHtml, Strin
     if ext_dir.is_dir() {
         cmd.arg("-d").arg(format!("extension_dir={}", ext_dir.display()));
     }
+    // PHP 8 + Windows ASLR 下 OPcache 在 php-cgi 进程会 fatal "Opcode handlers are unusable"，
+    // 这里只是查 phpinfo，opcache 没用处，强制关掉避免拿到空 stdout。
+    cmd.arg("-d").arg("opcache.enable=0");
+    cmd.arg("-d").arg("opcache.enable_cli=0");
     cmd.arg("-i"); // -i = phpinfo()，CGI SAPI 下走 HTML 分支
     #[cfg(target_os = "windows")]
     {
@@ -182,14 +186,25 @@ pub async fn get_phpinfo_html(install_path: String) -> Result<PhpInfoHtml, Strin
         .output()
         .map_err(|e| format!("启动 php-cgi.exe 失败: {}", e))?;
     let mut html = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
 
-    // -q 已经吃掉 HTTP 头，但有些 build（特别是带扩展加载警告时）头还会残留。
-    // 保险起见：如果 stdout 不是 <!DOCTYPE 起头，且能找到第一个 "<!DOCTYPE" 或 "<html"，从那里截。
+    // -q 已经吃掉 HTTP 头，但有些 build 头还会残留。从第一个 <!DOCTYPE / <html 截。
     let lower = html.to_ascii_lowercase();
     if !lower.trim_start().starts_with("<!doctype") && !lower.trim_start().starts_with("<html") {
         if let Some(idx) = lower.find("<!doctype").or_else(|| lower.find("<html")) {
             html = html[idx..].to_string();
         }
+    }
+
+    // 若 stdout 里根本没 HTML（php-cgi fatal 退出等），把错误反馈给前端，别静默给空白
+    if !html.to_ascii_lowercase().contains("<html") {
+        let code = out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into());
+        return Err(format!(
+            "php-cgi.exe 退出 code={} 但没有 HTML 输出\nstdout: {}\nstderr: {}",
+            code,
+            html.chars().take(500).collect::<String>(),
+            stderr.chars().take(500).collect::<String>(),
+        ));
     }
 
     let mut hasher = DefaultHasher::new();
