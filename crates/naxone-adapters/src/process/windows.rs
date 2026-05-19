@@ -215,6 +215,14 @@ impl WindowsProcessManager {
                 if let Some(conf) = &instance.config_path {
                     cmd.arg("-c").arg(conf);
                 }
+                // PHP 8 + Windows ASLR 下 OPcache 共享内存分配会 fatal，
+                // 必须给一个可写的 file_cache 目录走文件回退缓存（fallback=1 是默认值，显式声明）。
+                // 不显式设的话 php-cgi 直接退出，nginx fastcgi 全军覆没。
+                let cache_dir = install_path.join(".opcache-cache");
+                let _ = std::fs::create_dir_all(&cache_dir);
+                cmd.arg("-d")
+                    .arg(format!("opcache.file_cache={}", cache_dir.display()));
+                cmd.arg("-d").arg("opcache.file_cache_fallback=1");
                 cmd.current_dir(install_path);
                 Ok(cmd)
             }
