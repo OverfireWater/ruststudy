@@ -1,11 +1,11 @@
 {
-  "version": "v0.5.23",
-  "notes": "## NaxOne v0.5.23\n\n### 🔧 Bug 修复\n\n- **PHP 8 服务启动 OPcache fatal**：v0.5.22 只修了 phpinfo 命令路径，PHP-CGI 作为服务启动是另一条独立代码路径，同样的 ASLR 问题没修 —— 正式版一启动 PHP 8.5.6 nts 就 Fatal Error: Opcode handlers are unusable due to ASLR，nginx fastcgi 全部 502。本版给每个 PHP install 建 `.opcache-cache/` 文件夹，启动参数加 `-d opcache.file_cache=<dir> -d opcache.file_cache_fallback=1`，让 OPcache 在共享内存分配失败时回退到文件缓存。opcache 模块照常加载，性能不受影响。\n\n**强烈建议 PHP 8.x 用户立刻升级**（v0.5.22 及之前的 PHP 8 服务无法启动）。\n",
-  "pub_date": "2026-05-19T03:31:46Z",
+  "version": "v0.5.24",
+  "notes": "## NaxOne v0.5.24\n\n来自一次代码审查的 8 项整改，**无功能新增**，纯安全加固 + 代码清理。建议升级。\n\n### 🛡️ 安全加固\n\n- **PID 系统进程白名单**：仪表板「结束进程」误传 / 攻击者借端口诊断接口请求都拒杀 System / smss.exe / csrss.exe / wininit.exe / winlogon.exe / services.exe / lsass.exe / dwm.exe 等 11 个关键进程（PID 0/4/8 直接拒），避免误操作蓝屏 / 注销\n- **CSP 收紧**：之前 CSP 完全关闭，万一前端被 XSS 或 npm 包供应链攻击，所有 Tauri IPC（删文件 / 杀进程 / 改 hosts / 写 PATH）全裸奔。本版改为 `default-src 'self'` 收紧到本地资源 + IPC 通道，禁外部 JS / 禁未声明的 connect-src。已用 CDP 自动化测试主路由 + phpinfo iframe srcdoc，无 violation\n- **vhost 自签证书前置校验**：`generate_self_signed_cert` command 入口加 `is_safe_hostname` 双层校验（server_name + 所有 aliases），底层 `sanitize_filename` 是 defense in depth\n\n### 🧹 工程改善\n\n- **OPcache 文件缓存目录迁移**：从 `<php_install>/.opcache-cache/` 改到 `~/.naxone/opcache/<install_path_hash>/`，PHP 卸载 / 重装不再留旧 opcode 文件污染\n- **Workspace lints 统一**：根 Cargo.toml 加 `[workspace.lints.rust]`，3 个 crate 都用 `[lints]\\nworkspace = true` 继承。以后新加 lint 规则一处生效\n\n### 🗑️ 死码清理\n\n- 删 `commands/php.rs::get_phpinfo`（CLI 文本版，v0.5.21 起前端改用 HTML 版后无人调）+ main.rs IPC 注册\n- 删 `naxone-adapters/package/installer.rs::unwrap_single_subdir` + 3 个 unit test + 测试 helper\n\n### 🔧 测试基建\n\n- Dev 模式 (`#[cfg(debug_assertions)]`) 自动开 WebView2 CDP 9222 端口，供 `frontend/scripts/test-*-gui.mjs` 自动化测试用，prod 不开\n- 新增 `scripts/test-csp-gui.mjs`：通过 CDP 巡检所有主路由 + 注入 iframe srcdoc，验证 CSP 配置不破坏功能\n",
+  "pub_date": "2026-05-19T06:48:48Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjd2SmhYek1vVFlFa1hyYlRIWnVDY1FnV2pmdGU5Uk9OTmVVRFR4dEFlUTU2T0hGeVRyenRKTCtCUzFFNlExaFdNcWpSZFRHQ3RIcCsrbnJvTGNLVUE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MTYxNTA2CWZpbGU6TmF4T25lXzAuNS4yM194NjQtc2V0dXAuZXhlClNFMDVLanZpcDNGK2tEcUFkU1JYeEZtTDB5emFwWUJXdU9wTnlHYkxqNHV0V2VQOCtLWkR6d3ZMVkREZEhia1dLQWpLQXlwMnB5TGc5c1E4dEFTakRBPT0K",
-      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.23/NaxOne_0.5.23_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZitBTUROVFRQblVBQXZEOWdkbXFKWTZZS3FvT2JOMDZ3U0JrNmdxNXBMaEtvQnJSOGprM2FlM1A0ekM4ZnJxc1lWZllaM1FNOWp3aW1SWmU0QkdoVGdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MTczMzI4CWZpbGU6TmF4T25lXzAuNS4yNF94NjQtc2V0dXAuZXhlCitBRWJlVTIvcTZBenVHb0tGQ1ArOGhQMUcrbFJtRmh2SVNEQWp1WEdzRWF6QlFIV2JiUjdzQ3ZHa2tSN0N1OE91bFV6T1VINlcrUGhjSXoySnVOeERRPT0K",
+      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.24/NaxOne_0.5.24_x64-setup.exe"
     }
   }
 }
