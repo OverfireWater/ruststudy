@@ -30,6 +30,15 @@ fn main() {
         // SAFETY: main 顶层、单线程、tauri webview 创建之前，env 写入安全
         unsafe { std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &dir); }
         tracing::info!(path = %dir.display(), "WebView2 user data folder");
+        // Dev 模式开 CDP 9222，给 frontend/scripts/test-*-gui.mjs 自动化测试用。
+        // prod 不开（性能 + 安全考虑）。
+        #[cfg(debug_assertions)]
+        unsafe {
+            std::env::set_var(
+                "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                "--remote-debugging-port=9222",
+            );
+        }
     }
 
     let app_state = AppState::new();
@@ -77,7 +86,6 @@ fn main() {
             commands::php::toggle_php_extension,
             commands::php::get_php_ini_settings,
             commands::php::save_php_ini_settings,
-            commands::php::get_phpinfo,
             commands::php::get_phpinfo_html,
             commands::php::get_global_php_version,
             commands::php::set_global_php_version,

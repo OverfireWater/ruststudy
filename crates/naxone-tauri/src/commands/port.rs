@@ -107,17 +107,40 @@ fn identify_source(exe_path: Option<&str>) -> Option<String> {
     None
 }
 
+/// 拒绝杀的系统关键进程（小写匹配）。杀这些会蓝屏 / 注销 / 杀软告警。
+/// PID 0 / 4 / 8 是 System Idle / System / Secure System，本就杀不掉但显式拒绝避免误操作。
+const SYSTEM_CRITICAL_PROCESSES: &[&str] = &[
+    "system",
+    "registry",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "lsaiso.exe",
+    "fontdrvhost.exe",
+    "dwm.exe",
+];
+
 #[tauri::command]
 pub async fn kill_process_by_pid(
     pid: u32,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if pid == 0 {
-        push_log(&state, LogLevel::Error, "port", "结束进程失败：PID 无效", None, None).await;
-        return Err("PID 无效".into());
+    if pid == 0 || pid == 4 || pid == 8 {
+        push_log(&state, LogLevel::Error, "port", "结束进程失败：拒绝杀系统进程", None, None).await;
+        return Err("拒绝结束系统关键进程".into());
     }
     // 拿一下进程名加进日志，方便用户回溯
     let proc_name = get_process_name(pid).await.unwrap_or_else(|| "(未知)".to_string());
+    // 系统关键进程白名单拦截。即使任务管理器以管理员身份也不允许从 NaxOne 杀这些。
+    let proc_lower = proc_name.to_ascii_lowercase();
+    if SYSTEM_CRITICAL_PROCESSES.iter().any(|p| *p == proc_lower) {
+        let msg = format!("拒绝结束系统关键进程 {} (PID {})", proc_name, pid);
+        push_log(&state, LogLevel::Error, "port", msg.clone(), None, None).await;
+        return Err(msg);
+    }
 
     let output = Command::new("taskkill")
         .args(["/F", "/PID"])

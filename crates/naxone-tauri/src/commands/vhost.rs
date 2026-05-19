@@ -6,7 +6,7 @@ use crate::commands::logger::push_log;
 use crate::state::AppState;
 use naxone_core::domain::log::LogLevel;
 use naxone_core::domain::service::ServiceKind;
-use naxone_core::domain::vhost::{VhostSource, VirtualHost};
+use naxone_core::domain::vhost::{is_safe_hostname, VhostSource, VirtualHost};
 use naxone_core::use_cases::vhost_mgr::VhostManager;
 
 fn persist_vhosts(vhosts: &[VirtualHost], state: &AppState) {
@@ -62,6 +62,16 @@ pub async fn generate_self_signed_cert(
 ) -> Result<GeneratedCert, String> {
     if server_name.trim().is_empty() {
         return Err("请先填写域名（server_name）".into());
+    }
+    // 防止通过证书命令绕开 vhost 校验路径写出非法文件名（哪怕底层 sanitize_filename 兜底了，
+    // 也要在入口报错更明确，避免静默生成 `foo___bar.crt` 这种用户没想要的文件）
+    if !is_safe_hostname(&server_name) {
+        return Err(format!("域名格式不合法：{}", server_name));
+    }
+    for a in &aliases {
+        if !a.trim().is_empty() && !is_safe_hostname(a) {
+            return Err(format!("域名别名格式不合法：{}", a));
+        }
     }
     // 证书存放目录：~/.naxone/certs/（dev 用 .naxone-dev/certs/）
     let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".into());

@@ -7,7 +7,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.5.23"
+version = "0.5.24"
 edition = "2021"
 license = "MIT"
 
@@ -20,3 +20,9 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工作区级 lint 统一：在 crate Cargo.toml 加 `[lints]\nworkspace = true` 即继承。
+# 留个起点，后续要 deny 新的 lint 时改这里一处生效到全 crate。
+[workspace.lints.rust]
+unused_must_use = "warn"
+unreachable_patterns = "warn"

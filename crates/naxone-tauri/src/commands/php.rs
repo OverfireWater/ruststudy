@@ -82,53 +82,6 @@ pub async fn save_php_ini_settings(
     Ok(())
 }
 
-/// 跑 `<install>/php.exe -i`（含 NaxOne 的 -c <ini> 和 -d extension_dir 兜底），
-/// 返回纯文本 phpinfo 输出。前端按行渲染 + 搜索。
-#[tauri::command]
-pub async fn get_phpinfo(install_path: String) -> Result<String, String> {
-    use std::process::Command;
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
-
-    let install = std::path::PathBuf::from(&install_path);
-    let php_exe = install.join("php.exe");
-    if !php_exe.is_file() {
-        return Err(format!("php.exe 不存在: {}", php_exe.display()));
-    }
-    let ini = ["php.ini", "php.ini-production", "php.ini-development"]
-        .iter()
-        .map(|n| install.join(n))
-        .find(|p| p.is_file());
-    let ext_dir = install.join("ext");
-
-    let mut cmd = Command::new(&php_exe);
-    if let Some(ini_path) = &ini {
-        cmd.arg("-c").arg(ini_path);
-    }
-    if ext_dir.is_dir() {
-        cmd.arg("-d").arg(format!("extension_dir={}", ext_dir.display()));
-    }
-    cmd.arg("-i");
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("启动 php.exe 失败: {}", e))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    // phpinfo 输出在 stdout，stderr 通常是扩展加载警告 —— 一并附在末尾让用户能看到
-    let mut combined = stdout;
-    if !stderr.trim().is_empty() {
-        combined.push_str("\n\n========= stderr (扩展加载警告等) =========\n");
-        combined.push_str(&stderr);
-    }
-    Ok(combined)
-}
-
 // ==================== HTML phpinfo ====================
 
 #[derive(Debug, Clone, Serialize)]

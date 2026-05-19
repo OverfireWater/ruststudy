@@ -402,26 +402,6 @@ fn find_exe_root(unpacked: &Path, exe_rel: &str) -> PathBuf {
     search(unpacked, exe_rel, 3).unwrap_or_else(|| unpacked.to_path_buf())
 }
 
-/// If `dir` contains exactly one subdirectory and no regular files, return
-/// the path to that subdirectory. Otherwise None.
-fn unwrap_single_subdir(dir: &Path) -> Option<PathBuf> {
-    let rd = std::fs::read_dir(dir).ok()?;
-    let mut only_subdir: Option<PathBuf> = None;
-    for entry in rd.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if only_subdir.is_some() {
-                // More than one subdir → not a wrapper
-                return None;
-            }
-            only_subdir = Some(path);
-        } else {
-            // Any file means this is already the install root
-            return None;
-        }
-    }
-    only_subdir
-}
 
 async fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     let data = tokio::fs::read(path)
@@ -727,38 +707,4 @@ mod tests {
         assert_eq!(phpstudy_style_dir_name("nvm", "1.2.2"), "tools/nvm-1.2.2");
     }
 
-    fn tmp(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir()
-            .join("naxone-installer-test")
-            .join(format!("{}-{}", tag, std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    #[test]
-    fn unwrap_detects_single_subdir() {
-        let root = tmp("wrapper");
-        let inner = root.join("nginx-1.26.2");
-        std::fs::create_dir_all(&inner).unwrap();
-        std::fs::write(inner.join("nginx.exe"), b"").unwrap();
-
-        assert_eq!(unwrap_single_subdir(&root), Some(inner));
-    }
-
-    #[test]
-    fn unwrap_returns_none_when_files_present() {
-        let root = tmp("no-wrapper");
-        std::fs::write(root.join("redis-server.exe"), b"").unwrap();
-        std::fs::create_dir_all(root.join("dir")).unwrap();
-        assert_eq!(unwrap_single_subdir(&root), None);
-    }
-
-    #[test]
-    fn unwrap_returns_none_when_multiple_subdirs() {
-        let root = tmp("multi");
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        std::fs::create_dir_all(root.join("b")).unwrap();
-        assert_eq!(unwrap_single_subdir(&root), None);
-    }
 }

@@ -218,7 +218,17 @@ impl WindowsProcessManager {
                 // PHP 8 + Windows ASLR 下 OPcache 共享内存分配会 fatal，
                 // 必须给一个可写的 file_cache 目录走文件回退缓存（fallback=1 是默认值，显式声明）。
                 // 不显式设的话 php-cgi 直接退出，nginx fastcgi 全军覆没。
-                let cache_dir = install_path.join(".opcache-cache");
+                // 放在 ~/.naxone/opcache/<install_path_hash>/，跟 PHP install 目录解耦，
+                // 用户卸载/重装 PHP 不会留旧 opcode 文件污染。
+                let cache_dir = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut hasher = DefaultHasher::new();
+                    install_path.to_string_lossy().hash(&mut hasher);
+                    crate::platform::dirs::naxone_home_dir()
+                        .join("opcache")
+                        .join(format!("{:x}", hasher.finish()))
+                };
                 let _ = std::fs::create_dir_all(&cache_dir);
                 cmd.arg("-d")
                     .arg(format!("opcache.file_cache={}", cache_dir.display()));
