@@ -1,11 +1,11 @@
 {
-  "version": "v0.5.22",
-  "notes": "## NaxOne v0.5.22\n\n### 🔧 Bug 修复\n\n- **phpinfo 在 PHP 8 下显示空白**：`php-cgi.exe -i` 在 PHP 8 + Windows ASLR 下 OPcache 报 fatal \"Opcode handlers are unusable\" 后静默退出，phpinfo tab 一片空白。修复方式：调 php-cgi 时强制关 OPcache（`-d opcache.enable=0 -d opcache.enable_cli=0`，opcache 对查 phpinfo 没用处）\n- **phpinfo 失败不再静默**：php-cgi 没有输出 HTML 时直接把 stdout/stderr/exit code 报给前端，便于诊断\n\n### 升级方式\n\n已在用 NaxOne 的，下次启动会自动收到更新提示。\n新装请下载附件 `NaxOne_0.5.22_x64-setup.exe` 双击安装。\n",
-  "pub_date": "2026-05-18T09:04:57Z",
+  "version": "v0.5.23",
+  "notes": "## NaxOne v0.5.23\n\n### 🔧 Bug 修复\n\n- **PHP 8 服务启动 OPcache fatal**：v0.5.22 只修了 phpinfo 命令路径，PHP-CGI 作为服务启动是另一条独立代码路径，同样的 ASLR 问题没修 —— 正式版一启动 PHP 8.5.6 nts 就 Fatal Error: Opcode handlers are unusable due to ASLR，nginx fastcgi 全部 502。本版给每个 PHP install 建 `.opcache-cache/` 文件夹，启动参数加 `-d opcache.file_cache=<dir> -d opcache.file_cache_fallback=1`，让 OPcache 在共享内存分配失败时回退到文件缓存。opcache 模块照常加载，性能不受影响。\n\n**强烈建议 PHP 8.x 用户立刻升级**（v0.5.22 及之前的 PHP 8 服务无法启动）。\n",
+  "pub_date": "2026-05-19T03:31:46Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjlGKy8xZkJ0TUthN2tPR0dydW5lRUdGdVNtcHdSVUNYY0dSaitibTE1ZHE4UEdvT3V6SUFkaGNtV2lzQWFGTmhWT3VWZkp6YlhtMzJlMmQ0ZXlveWdRPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MDk1MDk3CWZpbGU6TmF4T25lXzAuNS4yMl94NjQtc2V0dXAuZXhlCnMvRWtraHBRMjdWWmFYc203SlppV01WZjNRdWR3QzhzcmFvSUxGQW54OHgyTTJzZ3RNTU42eXdHN1p4eFdvaTZ3eTFCYUtQYjYwMzNBdkgwQU44QURBPT0K",
-      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.22/NaxOne_0.5.22_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjd2SmhYek1vVFlFa1hyYlRIWnVDY1FnV2pmdGU5Uk9OTmVVRFR4dEFlUTU2T0hGeVRyenRKTCtCUzFFNlExaFdNcWpSZFRHQ3RIcCsrbnJvTGNLVUE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5MTYxNTA2CWZpbGU6TmF4T25lXzAuNS4yM194NjQtc2V0dXAuZXhlClNFMDVLanZpcDNGK2tEcUFkU1JYeEZtTDB5emFwWUJXdU9wTnlHYkxqNHV0V2VQOCtLWkR6d3ZMVkREZEhia1dLQWpLQXlwMnB5TGc5c1E4dEFTakRBPT0K",
+      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.23/NaxOne_0.5.23_x64-setup.exe"
     }
   }
 }
