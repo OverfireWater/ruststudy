@@ -22,8 +22,10 @@ impl NoWindow for Command {
     }
 }
 
+use naxone_core::domain::log::LogLevel;
 use naxone_core::domain::service::{ServiceInstance, ServiceKind, ServiceStatus};
 use naxone_core::error::{Result, NaxOneError};
+use naxone_core::ports::log_reporter::LogReporter;
 use naxone_core::ports::process::ProcessManager;
 
 struct ProcessInfo {
@@ -51,6 +53,9 @@ pub struct WindowsProcessManager {
     tasklist_cache: Arc<Mutex<Option<(Instant, HashMap<u32, u64>)>>>,
     /// PHP auto-restart: service_id → true while watchdog should keep it alive
     auto_restart: Arc<RwLock<HashMap<String, bool>>>,
+    /// 可选的活动日志上报通道。Tauri 启动时通过 set_reporter 注入。
+    /// 用 std::sync::Mutex 因为 trait method set_reporter 是同步签名。
+    reporter: Arc<std::sync::Mutex<Option<Arc<dyn LogReporter>>>>,
 }
 
 impl WindowsProcessManager {
@@ -61,6 +66,7 @@ impl WindowsProcessManager {
             netstat_cache: Arc::new(Mutex::new(None)),
             tasklist_cache: Arc::new(Mutex::new(None)),
             auto_restart: Arc::new(RwLock::new(HashMap::new())),
+            reporter: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -98,9 +104,23 @@ impl WindowsProcessManager {
         let auto_restart = self.auto_restart.clone();
         let status_cache = self.status_cache.clone();
         let netstat_cache = self.netstat_cache.clone();
+        let reporter_holder = self.reporter.clone();
         let inst = instance.clone();
 
+        let svc_label = format!("{} {}", inst.kind.display_name(), inst.version);
+
         tokio::spawn(async move {
+            // 上报辅助：每次读最新 reporter，没注入就 no-op
+            let report = |level: LogLevel, msg: String, details: Option<String>| {
+                let holder = reporter_holder.clone();
+                async move {
+                    let r = holder.lock().ok().and_then(|g| g.clone());
+                    if let Some(r) = r {
+                        r.report(level, "service", msg, details).await;
+                    }
+                }
+            };
+
             let mut crashes = 0u32;
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
@@ -116,8 +136,13 @@ impl WindowsProcessManager {
                     break;
                 }
 
-                // Still alive → reset crash counter
-                if probe_port(inst.port).await {
+                // 活检：先看端口有没有人在监听；再校验监听的 PID 跟我们记的一致。
+                // 不校验 PID 的话，端口被其他外部进程占了 watchdog 会误判 alive，
+                // 实际 PHP-CGI 已经死了 nginx 还在 502。
+                let our_pid = processes.read().await.get(&inst.id()).map(|p| p.pid).unwrap_or(0);
+                let listening_pid = netstat_snapshot().await.get(&inst.port).copied().unwrap_or(0);
+                let alive = listening_pid != 0 && (our_pid == 0 || listening_pid == our_pid);
+                if alive {
                     crashes = 0;
                     continue;
                 }
@@ -130,6 +155,11 @@ impl WindowsProcessManager {
                         port = inst.port,
                         "Auto-restart giving up (5 consecutive crashes)"
                     );
+                    report(
+                        LogLevel::Error,
+                        format!("{} 连续 5 次重启失败，已放弃自动恢复", svc_label),
+                        Some(format!("端口 {}：我们记录的 PID={}，当前 LISTENING PID={}", inst.port, our_pid, listening_pid)),
+                    ).await;
                     auto_restart.write().await.remove(&inst.id());
                     break;
                 }
@@ -140,38 +170,63 @@ impl WindowsProcessManager {
                     attempt = crashes,
                     "Process died, auto-restarting..."
                 );
+                report(
+                    LogLevel::Warn,
+                    format!("{} 已停止，正在自动重启（第 {}/5 次）", svc_label, crashes),
+                    Some(format!("端口 {}：原 PID={}，当前 LISTENING PID={}", inst.port, our_pid, listening_pid)),
+                ).await;
 
-                if let Ok(mut cmd) = Self::build_start_command(&inst) {
-                    cmd.no_window();
-                    match cmd
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn()
-                    {
-                        Ok(mut child) => {
-                            let new_pid = child.id().unwrap_or(0);
-                            // 显式 drop stdout/stderr 管道避免长期持有 → 底层 OS 句柄能尽早释放
-                            drop(child.stdout.take());
-                            drop(child.stderr.take());
-                            // detach child handle，让 OS 自行清理（PHP-CGI 是长期进程，watchdog 不 wait）
-                            drop(child);
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            processes
-                                .write()
-                                .await
-                                .insert(inst.id(), ProcessInfo { pid: new_pid });
-                            *netstat_cache.lock().await = None;
-                            status_cache.write().await.remove(&inst.id());
-                            tracing::info!(
-                                pid = new_pid,
-                                attempt = crashes,
-                                "PHP auto-restarted"
-                            );
+                match Self::build_start_command(&inst) {
+                    Ok(mut cmd) => {
+                        cmd.no_window();
+                        match cmd
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .spawn()
+                        {
+                            Ok(mut child) => {
+                                let new_pid = child.id().unwrap_or(0);
+                                // 显式 drop stdout/stderr 管道避免长期持有 → 底层 OS 句柄能尽早释放
+                                drop(child.stdout.take());
+                                drop(child.stderr.take());
+                                // detach child handle，让 OS 自行清理（PHP-CGI 是长期进程，watchdog 不 wait）
+                                drop(child);
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                processes
+                                    .write()
+                                    .await
+                                    .insert(inst.id(), ProcessInfo { pid: new_pid });
+                                *netstat_cache.lock().await = None;
+                                status_cache.write().await.remove(&inst.id());
+                                tracing::info!(
+                                    pid = new_pid,
+                                    attempt = crashes,
+                                    "PHP auto-restarted"
+                                );
+                                report(
+                                    LogLevel::Success,
+                                    format!("{} 自动重启成功（PID {}）", svc_label, new_pid),
+                                    None,
+                                ).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "PHP restart spawn failed");
+                                report(
+                                    LogLevel::Error,
+                                    format!("{} 自动重启 spawn 失败", svc_label),
+                                    Some(e.to_string()),
+                                ).await;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, "PHP restart spawn failed");
-                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "PHP restart build_start_command failed");
+                        report(
+                            LogLevel::Error,
+                            format!("{} 重启失败：无法构造启动命令", svc_label),
+                            Some(e.to_string()),
+                        ).await;
                     }
                 }
 
@@ -739,6 +794,79 @@ impl ProcessManager for WindowsProcessManager {
             _ => {}
         }
         Ok(())
+    }
+
+    fn set_reporter(&self, reporter: Arc<dyn LogReporter>) {
+        if let Ok(mut g) = self.reporter.lock() {
+            *g = Some(reporter);
+        }
+    }
+
+    async fn adopt_if_running(&self, instance: &ServiceInstance) -> Result<bool> {
+        // 只接管 PHP（其它服务现状就是单实例，启动失败 = 端口冲突，无意义 adopt）
+        if instance.kind != ServiceKind::Php {
+            return Ok(false);
+        }
+        // 已被监控（processes 表里有）→ 跳过
+        if self.processes.read().await.contains_key(&instance.id()) {
+            return Ok(false);
+        }
+        // 端口必须有 LISTENING
+        let listening_pid = netstat_snapshot()
+            .await
+            .get(&instance.port)
+            .copied()
+            .unwrap_or(0);
+        if listening_pid == 0 {
+            return Ok(false);
+        }
+        // 校验是 php-cgi.exe 且 exe 路径在 install_path 下，避免误把别的 PHP 安装当自己的
+        let exe = get_process_exe_path(listening_pid).await.unwrap_or_default();
+        if exe.is_empty() {
+            return Ok(false);
+        }
+        let exe_lower = exe.to_lowercase().replace('/', "\\");
+        let install_lower = instance
+            .install_path
+            .display()
+            .to_string()
+            .to_lowercase()
+            .replace('/', "\\");
+        if !exe_lower.contains(&install_lower) || !exe_lower.ends_with("php-cgi.exe") {
+            return Ok(false);
+        }
+
+        // 通过校验 → 认领
+        self.processes
+            .write()
+            .await
+            .insert(instance.id(), ProcessInfo { pid: listening_pid });
+        self.spawn_watchdog(instance).await;
+
+        // 上报活动日志
+        if let Some(r) = self.reporter.lock().ok().and_then(|g| g.clone()) {
+            r.report(
+                LogLevel::Info,
+                "service",
+                format!(
+                    "接管已存在的 {} {}（PID {} 端口 {}），已启动 watchdog 监控",
+                    instance.kind.display_name(),
+                    instance.version,
+                    listening_pid,
+                    instance.port
+                ),
+                None,
+            )
+            .await;
+        }
+        tracing::info!(
+            service = %instance.kind.display_name(),
+            version = %instance.version,
+            pid = listening_pid,
+            port = instance.port,
+            "Adopted orphan PHP-CGI"
+        );
+        Ok(true)
     }
 }
 

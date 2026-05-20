@@ -13,10 +13,20 @@ use tauri::{
 };
 
 fn main() {
-    // 默认 info 级别，方便排查安装/代理/状态刷新相关的诊断日志
+    // 默认 info 级别，方便排查安装/代理/状态刷新相关的诊断日志。
+    // 同时写文件 ~/.naxone/logs/trace-YYYY-MM-DD.log，让 watchdog 等后台事件可回查
+    // （NaxOne.exe 是桌面进程没有 console，纯 stdout fmt 等于黑洞）。
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hyper=warn,reqwest=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let log_dir = naxone_adapters::platform::dirs::naxone_home_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "trace");
+    // 用 try_init 容错：dev 模式 tauri 可能已 init 过 subscriber
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .try_init();
 
     // WebView2 user data folder 隔离：dev 用 `<home>/webview2`，prod 用同一逻辑路径但 home
     // 不同（dev=.naxone-dev，prod=.naxone）。这样：
@@ -42,6 +52,40 @@ fn main() {
     }
 
     let app_state = AppState::new();
+
+    // 注入 LogReporter：watchdog 等后台事件就能 push 到用户活动日志，
+    // 不再仅落入 tracing 黑洞。clone_shallow 共享底层 logs / log_id_counter Arc。
+    {
+        use commands::logger::AppStateLogReporter;
+        use naxone_core::ports::log_reporter::LogReporter;
+        use std::sync::Arc;
+        let reporter_state = std::sync::Arc::new(app_state.clone_shallow());
+        let reporter: Arc<dyn LogReporter> = Arc::new(AppStateLogReporter::new(reporter_state));
+        app_state.process_mgr.set_reporter(reporter);
+    }
+
+    // 接管孤儿 PHP-CGI：NaxOne 退出后 php-cgi 子进程作为孤儿继续监听端口；
+    // 新 NaxOne 启动后扫描每个 PHP 实例的端口，发现是自己 install 路径下的
+    // php-cgi.exe 就 adopt 进 processes 表并 spawn watchdog 监控。
+    // 否则用户重启 NaxOne 后 PHP 死了不会自动重启，仪表板灰点也没人查。
+    {
+        let pm = app_state.process_mgr.clone();
+        let services_arc = app_state.services.clone();
+        tauri::async_runtime::spawn(async move {
+            let services = services_arc.read().await.clone();
+            for svc in services
+                .iter()
+                .filter(|s| s.kind == naxone_core::domain::service::ServiceKind::Php)
+            {
+                if let Err(e) = pm.adopt_if_running(svc).await {
+                    tracing::warn!(
+                        version = %svc.version, error = %e,
+                        "adopt_if_running PHP 失败"
+                    );
+                }
+            }
+        });
+    }
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

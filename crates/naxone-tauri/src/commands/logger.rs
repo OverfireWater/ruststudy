@@ -1,6 +1,8 @@
 use crate::state::{resolve_log_dir, AppState};
 use naxone_core::domain::log::{LogEntry, LogLevel, LogStats};
+use naxone_core::ports::log_reporter::LogReporter;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::State;
 
 const MAX_BUFFER: usize = 1000;
@@ -71,6 +73,31 @@ pub async fn logged<T>(
         }
     }
     result
+}
+
+/// 把 AppState 包成 LogReporter，供 naxone-adapters 层（watchdog 等）
+/// 通过依赖反转往用户活动日志推事件。
+pub struct AppStateLogReporter {
+    state: Arc<AppState>,
+}
+
+impl AppStateLogReporter {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
+#[async_trait::async_trait]
+impl LogReporter for AppStateLogReporter {
+    async fn report(
+        &self,
+        level: LogLevel,
+        category: &str,
+        message: String,
+        details: Option<String>,
+    ) {
+        push_log(&self.state, level, category, message, details, None).await;
+    }
 }
 
 /// Spawn background task to write log entries to daily files

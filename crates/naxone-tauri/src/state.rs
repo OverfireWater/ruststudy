@@ -26,6 +26,9 @@ use naxone_core::use_cases::vhost_mgr::VhostManager;
 pub struct AppState {
     pub services: Arc<RwLock<Vec<ServiceInstance>>>,
     pub service_manager: ServiceManager,
+    /// 共享的 ProcessManager 实例（service_manager / vhost_manager 内部各持一份 clone）。
+    /// 用于在 main 启动尾段注入 LogReporter，watchdog 等后台事件可推到活动日志。
+    pub process_mgr: Arc<dyn ProcessManager>,
     pub vhost_manager: VhostManager,
     pub php_manager: PhpManager,
     pub config_editor: ConfigEditor,
@@ -50,6 +53,7 @@ impl AppState {
         Self {
             services: self.services.clone(),
             service_manager: self.service_manager.clone(),
+            process_mgr: self.process_mgr.clone(),
             vhost_manager: self.vhost_manager.clone(),
             php_manager: self.php_manager.clone(),
             config_editor: self.config_editor.clone(),
@@ -76,7 +80,7 @@ impl AppState {
             config_io.clone(),
             template_engine,
             platform_ops.clone(),
-            process_mgr,
+            process_mgr.clone(),
         );
         let php_manager = PhpManager::new(config_io.clone());
         let config_editor = ConfigEditor::new(config_io.clone());
@@ -163,6 +167,7 @@ impl AppState {
         Self {
             services: Arc::new(RwLock::new(services)),
             service_manager,
+            process_mgr,
             vhost_manager,
             php_manager,
             config_editor,

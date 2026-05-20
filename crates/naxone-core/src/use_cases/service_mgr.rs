@@ -153,16 +153,29 @@ impl ServiceManager {
                     }
                 });
                 let results = futures_util::future::join_all(futures).await;
+                // 关键：不再遇错就 return。把所有结果都处理完，成功的写回状态、
+                // 失败的收集到一起。否则一个 PHP 启动失败会让其它已经在跑的 PHP
+                // 的状态没被更新（虽然进程已经 spawn），用户看到的 UI 数据错位。
+                let mut failed: Vec<String> = Vec::new();
                 for (idx, res) in results {
                     match res {
                         Ok(updated) => all_services[idx].status = updated.status,
                         Err(e) => {
-                            return Err(NaxOneError::Process(format!(
-                                "联动启动 PHP-CGI {} 失败: {}",
-                                all_services[idx].version, e
-                            )));
+                            failed.push(format!(
+                                "{} {}: {}",
+                                all_services[idx].kind.display_name(),
+                                all_services[idx].version,
+                                e
+                            ));
                         }
                     }
+                }
+                if !failed.is_empty() {
+                    return Err(NaxOneError::Process(format!(
+                        "联动启动 {} 个 PHP-CGI 失败:\n{}",
+                        failed.len(),
+                        failed.join("\n")
+                    )));
                 }
             }
         }
