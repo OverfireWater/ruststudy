@@ -208,6 +208,34 @@ pub fn get_nvm_home() -> Option<PathBuf> {
     }
 }
 
+/// 读 NVM_SYMLINK 环境变量。旧安装若没有写环境变量，则从 settings.txt 的 path 字段回退读取。
+pub fn get_nvm_symlink(nvm_home: &Path) -> Option<PathBuf> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = nvm_home;
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(val) = read_env_var_user_or_system("NVM_SYMLINK") {
+            let path = PathBuf::from(val);
+            if !path.as_os_str().is_empty() {
+                return Some(path);
+            }
+        }
+
+        let settings = std::fs::read_to_string(nvm_home.join("settings.txt")).ok()?;
+        settings.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            if !key.trim().eq_ignore_ascii_case("path") {
+                return None;
+            }
+            let path = PathBuf::from(value.trim());
+            if path.as_os_str().is_empty() { None } else { Some(path) }
+        })
+    }
+}
+
 /// 扫描 NVM_HOME 下已安装的 Node.js 版本（降序：最新在前）。
 pub fn list_node_versions(nvm_home: &Path) -> Vec<String> {
     let mut versions = Vec::new();
@@ -220,6 +248,46 @@ pub fn list_node_versions(nvm_home: &Path) -> Vec<String> {
     }
     versions.sort_by(|a, b| cmp_semver(b, a));
     versions
+}
+
+/// 只接受完整的 Node.js 三段式版本号，避免把任意参数传给 nvm.exe。
+pub fn normalize_node_version(version: &str) -> Option<String> {
+    let version = version.trim().trim_start_matches(['v', 'V']);
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+/// 解析 nvm-windows `list available` 表格，只保留当前版和 LTS 两列。
+pub fn parse_available_node_versions(stdout: &str) -> (Vec<String>, Vec<String>) {
+    let mut current = Vec::new();
+    let mut lts = Vec::new();
+
+    for line in stdout.lines() {
+        let columns: Vec<&str> = line.split('|').map(str::trim).collect();
+        if columns.len() < 4 {
+            continue;
+        }
+
+        if let Some(version) = normalize_node_version(columns[1]) {
+            if !current.contains(&version) {
+                current.push(version);
+            }
+        }
+        if let Some(version) = normalize_node_version(columns[2]) {
+            if !lts.contains(&version) {
+                lts.push(version);
+            }
+        }
+    }
+
+    (current, lts)
 }
 
 /// 运行 `node --version` 获取当前活动的 Node.js 版本。
@@ -243,10 +311,15 @@ pub fn get_current_node_version() -> Option<String> {
 }
 
 /// 调用 `nvm use <version>` 切换当前 Node.js。
-pub fn switch_node(nvm_exe: &Path, version: &str) -> Result<String, String> {
+pub fn switch_node(
+    nvm_exe: &Path,
+    nvm_home: &Path,
+    nvm_symlink: &Path,
+    version: &str,
+) -> Result<String, String> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (nvm_exe, version);
+        let _ = (nvm_exe, nvm_home, nvm_symlink, version);
         return Err("unsupported".into());
     }
     #[cfg(target_os = "windows")]
@@ -255,6 +328,8 @@ pub fn switch_node(nvm_exe: &Path, version: &str) -> Result<String, String> {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let out = std::process::Command::new(nvm_exe)
             .args(["use", version])
+            .env("NVM_HOME", nvm_home)
+            .env("NVM_SYMLINK", nvm_symlink)
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| format!("nvm use 失败: {}", e))?;
@@ -558,5 +633,27 @@ mod tests {
         assert_eq!(parse_nvm_version("v1.1.12\r\n"), Some("1.1.12".into()));
         assert_eq!(parse_nvm_version(""), None);
         assert_eq!(parse_nvm_version("not-a-version\n"), None);
+    }
+
+    #[test]
+    fn validates_node_versions() {
+        assert_eq!(normalize_node_version("v22.22.3"), Some("22.22.3".into()));
+        assert_eq!(normalize_node_version(" 0.12.18 "), Some("0.12.18".into()));
+        assert_eq!(normalize_node_version("22"), None);
+        assert_eq!(normalize_node_version("22.1-beta"), None);
+        assert_eq!(normalize_node_version("22.1.0 --delete"), None);
+    }
+
+    #[test]
+    fn parses_nvm_available_table() {
+        let out = r#"
+|   CURRENT    |     LTS      |  OLD STABLE  | OLD UNSTABLE |
+|--------------|--------------|--------------|--------------|
+|    26.5.0    |   24.18.0    |   0.12.18    |   0.11.16    |
+|    26.4.0    |   22.23.1    |   0.12.17    |   0.11.15    |
+"#;
+        let (current, lts) = parse_available_node_versions(out);
+        assert_eq!(current, vec!["26.5.0", "26.4.0"]);
+        assert_eq!(lts, vec!["24.18.0", "22.23.1"]);
     }
 }

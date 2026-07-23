@@ -24,6 +24,7 @@ interface GlobalPhpInfo {
 interface ComposerOption { version: string; source: string; phar_path: string; }
 interface ComposerToolInfo { active_version: string | null; available: ComposerOption[]; }
 interface NvmToolInfo { nvm_version: string; nvm_source: string; nvm_home: string; current_node: string | null; installed_nodes: string[]; }
+interface NodeVersionCatalog { current: string[]; lts: string[]; }
 interface MysqlOption { version: string; install_path: string; data_dir: string; bin_dir: string; port: number; initialized: boolean; root_password: string; source: string; }
 interface MysqlToolInfo { active_version: string | null; available: MysqlOption[]; conflicts: string[]; }
 interface DevToolsInfo { composer: ComposerToolInfo | null; nvm: NvmToolInfo | null; mysql: MysqlToolInfo | null; }
@@ -60,6 +61,14 @@ const mysqlCurrentPwd = ref("");
 const showMysqlPwd = ref(false);
 const mysqlConflictFixBusy = ref(false);
 const nodeSwitchBusy = ref(false);
+const nodeCatalog = ref<NodeVersionCatalog>({ current: [], lts: [] });
+const nodeCatalogBusy = ref(false);
+const nodeCatalogLoaded = ref(false);
+const nodeInstallPick = ref("");
+const nodeCustomVersion = ref("");
+const nodeActivateAfterInstall = ref(true);
+const nodeInstallBusy = ref(false);
+const nodeUninstallBusy = ref(false);
 const composerSwitchBusy = ref(false);
 const mysqlSwitchBusy = ref(false);
 const mysqlPwdBusy = ref(false);
@@ -71,6 +80,25 @@ const phpServices = computed(() => services.value.filter(s => s.kind === "php"))
 const currentMysqlOption = computed<MysqlOption | undefined>(() =>
   devTools.value.mysql?.available.find(a => a.version === mysqlPick.value)
 );
+
+const nodeDownloadOptions = computed(() => {
+  const installed = new Set(devTools.value.nvm?.installed_nodes ?? []);
+  const options: Array<{ label: string; value: string }> = [];
+  const seen = new Set<string>();
+  for (const version of nodeCatalog.value.lts) {
+    if (!installed.has(version) && !seen.has(version)) {
+      options.push({ label: `v${version} · LTS`, value: version });
+      seen.add(version);
+    }
+  }
+  for (const version of nodeCatalog.value.current) {
+    if (!installed.has(version) && !seen.has(version)) {
+      options.push({ label: `v${version} · Current`, value: version });
+      seen.add(version);
+    }
+  }
+  return options;
+});
 
 // 切换 MySQL 实例时把已存的 root 密码回填到输入框（默认 type=password 显示为 ***）
 watch(currentMysqlOption, (opt) => {
@@ -179,6 +207,64 @@ async function switchNode() {
     emit("global-env-changed");
   } catch (e) { showError(`切换失败: ${e}`); }
   finally { nodeSwitchBusy.value = false; }
+}
+
+async function loadNodeCatalog() {
+  if (nodeCatalogBusy.value) return;
+  nodeCatalogBusy.value = true;
+  try {
+    nodeCatalog.value = await invoke("list_available_node_versions");
+    nodeCatalogLoaded.value = true;
+    if (!nodeInstallPick.value || !nodeDownloadOptions.value.some(o => o.value === nodeInstallPick.value)) {
+      nodeInstallPick.value = nodeDownloadOptions.value[0]?.value ?? "";
+    }
+  } catch (e) { showError(`获取 Node.js 可下载版本失败: ${e}`); }
+  finally { nodeCatalogBusy.value = false; }
+}
+
+async function installNode() {
+  if (nodeInstallBusy.value) return;
+  const version = (nodeCustomVersion.value.trim() || nodeInstallPick.value).replace(/^v/i, "");
+  if (!/^\d+\.\d+\.\d+$/.test(version)) {
+    showError("请输入完整的 Node.js 版本号，例如 22.22.3");
+    return;
+  }
+
+  nodeInstallBusy.value = true;
+  try {
+    const result: NvmToolInfo = await invoke("install_node_version", {
+      version,
+      activate: nodeActivateAfterInstall.value,
+    });
+    devTools.value = { ...devTools.value, nvm: result };
+    nodePick.value = nodeActivateAfterInstall.value ? (result.current_node ?? version) : version;
+    nodeCustomVersion.value = "";
+    nodeInstallPick.value = nodeDownloadOptions.value[0]?.value ?? "";
+    const suffix = nodeActivateAfterInstall.value ? "并已设为当前版本" : "";
+    toast.success(`Node.js v${version} 已下载安装${suffix}`);
+    emit("global-env-changed");
+  } catch (e) { showError(`安装失败: ${e}`); }
+  finally { nodeInstallBusy.value = false; }
+}
+
+async function uninstallNode() {
+  const version = nodePick.value;
+  if (!version || nodeUninstallBusy.value || version === devTools.value.nvm?.current_node) return;
+  const ok = await confirm(
+    `确定卸载 Node.js v${version}？该版本目录及其全局 npm 包会被删除。`,
+    { title: "卸载 Node.js", kind: "warning" }
+  );
+  if (!ok) return;
+
+  nodeUninstallBusy.value = true;
+  try {
+    const result: NvmToolInfo = await invoke("uninstall_node_version", { version });
+    devTools.value = { ...devTools.value, nvm: result };
+    nodePick.value = result.current_node ?? result.installed_nodes[0] ?? "";
+    toast.success(`Node.js v${version} 已卸载`);
+    emit("global-env-changed");
+  } catch (e) { showError(`卸载失败: ${e}`); }
+  finally { nodeUninstallBusy.value = false; }
 }
 
 async function loadComposerRepo() {
@@ -479,10 +565,11 @@ onUnmounted(() => {
           <span class="env-label">当前 Node</span>
           <span v-if="devTools.nvm.current_node" class="env-value">v{{ devTools.nvm.current_node }}</span>
           <span v-else class="env-value env-warn">未启用</span>
+          <span class="env-path" :title="devTools.nvm.nvm_home">{{ devTools.nvm.nvm_home }}</span>
         </div>
         <div class="env-row">
           <template v-if="devTools.nvm.installed_nodes.length > 0">
-            <span class="env-label">切换到</span>
+            <span class="env-label">已安装</span>
             <SelectMenu
               v-model="nodePick"
               :options="devTools.nvm.installed_nodes.map(v => ({
@@ -492,14 +579,61 @@ onUnmounted(() => {
               trigger-class="version-sel version-sel-btn"
             />
             <button class="btn btn-primary btn-sm ml-auto"
-                    :disabled="!nodePick || nodeSwitchBusy || nodePick === devTools.nvm.current_node"
+                    :disabled="!nodePick || nodeSwitchBusy || nodeInstallBusy || nodeUninstallBusy || nodePick === devTools.nvm.current_node"
                     @click="switchNode">
-              {{ nodeSwitchBusy ? '切换中...' : (nodePick === devTools.nvm.current_node ? '当前' : '切换') }}
+              {{ nodeSwitchBusy ? '切换中...' : (nodePick === devTools.nvm.current_node ? '当前使用' : '使用 / 切换') }}
+            </button>
+            <button class="btn btn-danger btn-sm"
+                    :disabled="!nodePick || nodeSwitchBusy || nodeInstallBusy || nodeUninstallBusy || nodePick === devTools.nvm.current_node"
+                    :title="nodePick === devTools.nvm.current_node ? '请先切换到其他版本' : '卸载所选版本'"
+                    @click="uninstallNode">
+              {{ nodeUninstallBusy ? '卸载中...' : '卸载' }}
             </button>
           </template>
           <template v-else>
-            <span class="env-empty">未安装 Node 版本（用 <code>nvm install &lt;version&gt;</code> 装一个）</span>
+            <span class="env-label">已安装</span>
+            <span class="env-empty">暂无 Node.js 版本，请在下方下载安装。</span>
           </template>
+        </div>
+        <div class="env-row">
+          <span class="env-label">可下载</span>
+          <template v-if="nodeCatalogLoaded">
+            <SelectMenu
+              v-if="nodeDownloadOptions.length > 0"
+              v-model="nodeInstallPick"
+              :options="nodeDownloadOptions"
+              trigger-class="version-sel version-sel-btn node-version-sel"
+            />
+            <span v-else class="env-empty">列表中的版本均已安装</span>
+          </template>
+          <span v-else class="env-empty">点击获取 NVM 官方版本列表</span>
+          <button class="btn btn-secondary btn-sm ml-auto"
+                  :disabled="nodeCatalogBusy || nodeInstallBusy"
+                  @click="loadNodeCatalog">
+            {{ nodeCatalogBusy ? '获取中...' : (nodeCatalogLoaded ? '刷新列表' : '获取版本') }}
+          </button>
+        </div>
+        <div class="env-row">
+          <span class="env-label">精确版本</span>
+          <input
+            v-model="nodeCustomVersion"
+            class="input node-version-input"
+            placeholder="可选，如 22.22.3；填写后优先"
+            :disabled="nodeInstallBusy"
+            @keyup.enter="installNode"
+          />
+          <label class="node-activate-check">
+            <input v-model="nodeActivateAfterInstall" type="checkbox" :disabled="nodeInstallBusy" />
+            安装后立即使用
+          </label>
+          <button class="btn btn-primary btn-sm ml-auto"
+                  :disabled="nodeInstallBusy || nodeSwitchBusy || nodeUninstallBusy || (!nodeCustomVersion.trim() && !nodeInstallPick)"
+                  @click="installNode">
+            {{ nodeInstallBusy ? '下载并安装中...' : '下载并安装' }}
+          </button>
+        </div>
+        <div class="node-tip">
+          安装由 nvm-windows 完成；“安装后立即使用”会在下载完成后自动执行 <code>nvm use</code>。
         </div>
       </template>
     </div>
@@ -655,6 +789,16 @@ onUnmounted(() => {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   color: var(--color-success-light);
 }
+.env-path {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  color: var(--text-muted);
+}
 .env-port {
   font-size: 13px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -717,6 +861,33 @@ onUnmounted(() => {
   color: var(--text-primary);
   background: var(--bg-hover);
 }
+.node-version-input {
+  width: 190px;
+  min-width: 140px;
+  height: 30px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  font-size: 13px;
+  line-height: 1.25;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.node-activate-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.node-activate-check input {
+  accent-color: var(--color-primary);
+}
+.node-tip {
+  padding: 4px 0 0 80px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
 
 .conflict-banner {
   background: rgba(245, 158, 11, 0.08);
@@ -733,6 +904,9 @@ onUnmounted(() => {
 :deep(.rs-select-trigger.version-sel-btn) {
   width: auto;
   min-width: 140px;
+}
+:deep(.rs-select-trigger.node-version-sel) {
+  min-width: 190px;
 }
 
 code {

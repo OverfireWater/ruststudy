@@ -59,6 +59,8 @@ pub struct GeneratedCert {
 pub async fn generate_self_signed_cert(
     server_name: String,
     aliases: Vec<String>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
 ) -> Result<GeneratedCert, String> {
     if server_name.trim().is_empty() {
         return Err("请先填写域名（server_name）".into());
@@ -74,8 +76,7 @@ pub async fn generate_self_signed_cert(
         }
     }
     // 证书存放目录：~/.naxone/certs/（dev 用 .naxone-dev/certs/）
-    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".into());
-    let out_dir = PathBuf::from(home).join(crate::state::naxone_home_dirname()).join("certs");
+    let out_dir = certs_dir();
 
     let (cert, key) = naxone_adapters::platform::ssl_cert::generate_self_signed(
         &server_name,
@@ -83,10 +84,97 @@ pub async fn generate_self_signed_cert(
         &out_dir,
     )?;
 
+    // CA 生成完 → 立即同步 cabundle + 注入 php.ini，让 PHP curl 也能信任本地 CA
+    refresh_php_cabundle_trust(&app, &state).await;
+
     Ok(GeneratedCert {
         cert_path: cert.display().to_string(),
         key_path: key.display().to_string(),
     })
+}
+
+/// 证书目录 `~/.naxone/certs/`（dev 用 `.naxone-dev/certs/`）
+fn certs_dir() -> PathBuf {
+    let home = std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".into());
+    PathBuf::from(home).join(crate::state::naxone_home_dirname()).join("certs")
+}
+
+/// 解析 bundle 进 NaxOne 的 Mozilla cacert.pem 资源路径。
+/// release 走 Tauri Resource；dev 走 crate manifest 下的 resources/。
+fn resolve_bundled_cacert(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    if let Ok(p) = app
+        .path()
+        .resolve("resources/cacert.pem", tauri::path::BaseDirectory::Resource)
+    {
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    #[cfg(debug_assertions)]
+    {
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join("cacert.pem");
+        if dev.exists() {
+            return Some(dev);
+        }
+    }
+    None
+}
+
+/// 同步 cabundle + 把所有 PHP install 的 php.ini 注入 curl.cainfo / openssl.cafile。
+/// 静默策略：每个 PHP 的注入失败只记录 push_log warn，不向上抛错（用户证书已经发好了）。
+pub async fn refresh_php_cabundle_trust(app: &tauri::AppHandle, state: &AppState) {
+    use naxone_adapters::package::post_install::ensure_php_ini_cabundle;
+    use naxone_adapters::platform::ssl_cert::ensure_cabundle;
+    use naxone_core::domain::log::LogLevel;
+    use naxone_core::domain::service::ServiceKind;
+
+    let Some(bundled) = resolve_bundled_cacert(app) else {
+        crate::commands::logger::push_log(
+            state, LogLevel::Warn, "ssl",
+            "未找到内置 cacert.pem（resources/cacert.pem 缺失），跳过 PHP cabundle 注入",
+            None, None,
+        ).await;
+        return;
+    };
+    let cabundle = match ensure_cabundle(&certs_dir(), &bundled) {
+        Ok(p) => p,
+        Err(e) => {
+            // CA 还没生成 → silently skip（首次生成证书前会触发，正常）
+            tracing::debug!(error=%e, "ensure_cabundle 跳过");
+            return;
+        }
+    };
+
+    let services = state.services.read().await;
+    let mut patched = 0u32;
+    let mut failed = Vec::new();
+    for svc in services.iter().filter(|s| s.kind == ServiceKind::Php) {
+        match ensure_php_ini_cabundle(&svc.install_path, &cabundle) {
+            Ok(true) => patched += 1,
+            Ok(false) => {}
+            Err(e) => failed.push(format!("{}: {}", svc.version, e)),
+        }
+    }
+    drop(services);
+    if patched > 0 {
+        crate::commands::logger::push_log(
+            state, LogLevel::Success, "ssl",
+            format!("PHP curl/OpenSSL 已信任 NaxOne 本地 CA（注入 {} 个 PHP）", patched),
+            Some(format!("cabundle: {}", cabundle.display())),
+            None,
+        ).await;
+    }
+    if !failed.is_empty() {
+        crate::commands::logger::push_log(
+            state, LogLevel::Warn, "ssl",
+            format!("部分 PHP 注入 cabundle 失败（{} 个）", failed.len()),
+            Some(failed.join("\n")),
+            None,
+        ).await;
+    }
 }
 
 /// Best-effort：尝试给端口加 Windows 防火墙入站放行。
@@ -581,6 +669,7 @@ pub async fn create_vhost(
     let mut vhosts = state.vhosts.write().await;
     vhosts.push(vhost);
     persist_vhosts(&vhosts, &state);
+    crate::commands::service::schedule_php_runtime_reconcile(state.inner());
     Ok(all_infos(&vhosts))
 }
 
@@ -632,6 +721,7 @@ pub async fn update_vhost(
     let port_changed = old.listen_port != new_vhost.listen_port;
     vhosts[idx] = new_vhost.clone();
     persist_vhosts(&vhosts, &state);
+    crate::commands::service::schedule_php_runtime_reconcile(state.inner());
 
     // 端口变更 → 新端口放行、旧端口若无人用则关闭
     if port_changed {
@@ -675,6 +765,7 @@ pub async fn delete_vhost(
     // 物理删除成功：立即从内存列表+持久化移除，避免 UI 卡在旧状态
     vhosts.remove(idx);
     persist_vhosts(&vhosts, &state);
+    crate::commands::service::schedule_php_runtime_reconcile(state.inner());
 
     // 独立 reload：失败不回滚删除（删了就是删了），但要明确通知用户手动重启
     if let Some(ws) = running_ws {
@@ -758,6 +849,7 @@ pub async fn toggle_vhost(
         None, None).await;
 
     persist_vhosts(&vhosts, &state);
+    crate::commands::service::schedule_php_runtime_reconcile(state.inner());
     Ok(all_infos(&vhosts))
 }
 
@@ -792,6 +884,7 @@ pub async fn check_expired_vhosts(state: State<'_, AppState>) -> Result<Vec<Vhos
 
     if changed {
         persist_vhosts(&vhosts, &state);
+        crate::commands::service::schedule_php_runtime_reconcile(state.inner());
         // Reload web server
         let services = state.services.read().await;
         if let Some(ws) = VhostManager::find_running_web_server(&services) {

@@ -177,6 +177,9 @@ fn main() {
             commands::package::preview_system_tool_uninstall,
             commands::tools::get_dev_tools_info,
             commands::tools::switch_node_version,
+            commands::tools::list_available_node_versions,
+            commands::tools::install_node_version,
+            commands::tools::uninstall_node_version,
             commands::tools::set_global_composer,
             commands::tools::get_composer_repo,
             commands::tools::set_composer_repo,
@@ -245,7 +248,10 @@ fn main() {
             // 启动迁移：给已经装好的 PHP 修 php.ini 的 extension_dir。
             // 商店包 / 历史装的 PHP 默认 extension_dir 全注释，导致 openssl 等扩展加载失败 →
             // composer create-project / php-cgi 跑站点都会受影响。幂等，已修复的 PHP 不再改。
+            // 顺便：若 NaxOne CA 已存在，重建 cabundle + 注入 curl.cainfo/openssl.cafile，
+            // 让 PHP curl/file_get_contents 信任本地 dev CA（浏览器走系统库，PHP 走 ini）。
             {
+                let app_handle = app.handle().clone();
                 let state = app.state::<AppState>();
                 let state_clone = state.inner().clone_shallow();
                 tauri::async_runtime::spawn(async move {
@@ -258,6 +264,8 @@ fn main() {
                             Err(e) => tracing::warn!(install = %svc.install_path.display(), "PHP 启动迁移失败: {}", e),
                         }
                     }
+                    // CA 已存在则同步 cabundle 信任（首次没生成证书时静默跳过）
+                    commands::vhost::refresh_php_cabundle_trust(&app_handle, &state_clone).await;
                 });
             }
 
@@ -350,15 +358,23 @@ fn main() {
                 let state = app.state::<AppState>();
                 let services = state.services.clone();
                 let config = state.config.clone();
+                let vhosts = state.vhosts.clone();
                 let service_manager = state.service_manager.clone();
                 let errors = state.startup_errors.clone();
                 tauri::async_runtime::spawn(async move {
-                    let auto_start = config.read().await.general.auto_start.clone();
+                    let config_snapshot = config.read().await.clone();
+                    let auto_start = config_snapshot.general.auto_start.clone();
                     if auto_start.is_empty() { return; }
 
                     // 用 snapshot + start_with_deps，让自启 web 服务器时自动联动 PHP-CGI；
                     // start_with_deps 还会处理 Nginx/Apache 互斥和同 kind 多版本互斥。
-                    let snapshot = { services.read().await.clone() };
+                    let mut snapshot = { services.read().await.clone() };
+                    let vhost_snapshot = vhosts.read().await.clone();
+                    naxone_core::use_cases::php_runtime::apply_php_runtime_policy(
+                        &mut snapshot,
+                        &vhost_snapshot,
+                        &config_snapshot.php_runtime,
+                    );
 
                     for (idx, svc) in snapshot.iter().enumerate() {
                         let kind_name = svc.kind.display_name().to_lowercase();
@@ -402,7 +418,7 @@ fn main() {
                                 }
                                 for o in &others {
                                     if let Some(s) = svcs.iter_mut().find(|s| s.id() == o.id()) {
-                                        s.status = o.status.clone();
+                                        *s = o.clone();
                                     }
                                 }
                             }

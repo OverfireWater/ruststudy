@@ -41,6 +41,7 @@ impl PhpStudyScanner {
                                 status: ServiceStatus::Stopped,
                                 auto_start: false,
                                 origin: ServiceOrigin::PhpStudy,
+                                php_runtime: None,
                             });
                             port += 1;
                         }
@@ -147,6 +148,7 @@ fn scan_service_dirs(
                     status: ServiceStatus::Stopped,
                     auto_start: false,
                     origin: ServiceOrigin::PhpStudy,
+                    php_runtime: None,
                 });
             }
         }

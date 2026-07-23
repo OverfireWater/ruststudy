@@ -40,6 +40,8 @@ pub struct AppState {
     pub log_writer_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<LogEntry>>>>,
     /// 后台 status 刷新的 single-flight 标志：已有刷新在跑时跳过新触发
     pub refresh_in_flight: Arc<AtomicBool>,
+    /// Serializes PHP pool reconciliation triggered by rapid vhost changes.
+    pub php_reconcile_lock: Arc<tokio::sync::Mutex<()>>,
     /// 平台相关操作（hosts 文件、防火墙），命令层也要直接用
     pub platform_ops: Arc<dyn PlatformOps>,
     /// 当前正在跑的模板装包子进程 PID（如 composer create-project）。
@@ -64,6 +66,7 @@ impl AppState {
             log_id_counter: self.log_id_counter.clone(),
             log_writer_tx: self.log_writer_tx.clone(),
             refresh_in_flight: self.refresh_in_flight.clone(),
+            php_reconcile_lock: self.php_reconcile_lock.clone(),
             platform_ops: self.platform_ops.clone(),
             template_child_pid: self.template_child_pid.clone(),
         }
@@ -134,7 +137,7 @@ impl AppState {
             store_extensions = ?store_ext,
             "Resolved store extensions root",
         );
-        let services = CompositeScanner::scan(
+        let mut services = CompositeScanner::scan(
             ext_path.as_deref(),
             Some(&store_ext),
             &config.general.extra_install_paths,
@@ -163,6 +166,11 @@ impl AppState {
             Vec::new()
         };
         let vhosts = VhostManager::merge_vhosts(scanned_vhosts, saved_vhosts);
+        naxone_core::use_cases::php_runtime::apply_php_runtime_policy(
+            &mut services,
+            &vhosts,
+            &config.php_runtime,
+        );
 
         Self {
             services: Arc::new(RwLock::new(services)),
@@ -178,6 +186,7 @@ impl AppState {
             log_id_counter: Arc::new(AtomicU64::new(0)),
             log_writer_tx: Arc::new(tokio::sync::Mutex::new(None)),
             refresh_in_flight: Arc::new(AtomicBool::new(false)),
+            php_reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
             platform_ops,
             template_child_pid: Arc::new(tokio::sync::Mutex::new(None)),
         }

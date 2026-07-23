@@ -113,6 +113,7 @@ pub(crate) fn probe_install(path: &Path, kind: ServiceKind, origin: ServiceOrigi
         status: ServiceStatus::Stopped,
         auto_start: false,
         origin,
+        php_runtime: None,
     })
 }
 

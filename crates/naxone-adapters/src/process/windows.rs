@@ -29,7 +29,9 @@ use naxone_core::ports::log_reporter::LogReporter;
 use naxone_core::ports::process::ProcessManager;
 
 struct ProcessInfo {
-    pid: u32,
+    /// Root process spawned by NaxOne (or discovered by walking up from the
+    /// listening PHP worker during orphan adoption).
+    root_pid: u32,
 }
 
 /// status 缓存 TTL：低于前端 5s 轮询间隔，用户操作后下一轮就能看到变化
@@ -53,6 +55,13 @@ pub struct WindowsProcessManager {
     tasklist_cache: Arc<Mutex<Option<(Instant, HashMap<u32, u64>)>>>,
     /// PHP auto-restart: service_id → true while watchdog should keep it alive
     auto_restart: Arc<RwLock<HashMap<String, bool>>>,
+    /// 每个 service 当前活跃的 watchdog 代号（递增）。spawn 新 watchdog 时 +1，
+    /// 旧 watchdog 下一轮 sleep 醒来发现 gen 跟自己捕获的不一致就 break。
+    watchdog_gen: Arc<RwLock<HashMap<String, u64>>>,
+    /// 当前 watchdog tokio task handle，spawn 新的之前 abort 旧的 handle。
+    /// 双保险（gen 检查 + abort）：abort 立刻取消旧 task 不用等 sleep 醒来，
+    /// 防止 stop→start 2 秒窗口内旧 watchdog 跟新的并存导致 PID 表撕裂 + 雪崩重启。
+    watchdog_handles: Arc<tokio::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// 可选的活动日志上报通道。Tauri 启动时通过 set_reporter 注入。
     /// 用 std::sync::Mutex 因为 trait method set_reporter 是同步签名。
     reporter: Arc<std::sync::Mutex<Option<Arc<dyn LogReporter>>>>,
@@ -66,6 +75,8 @@ impl WindowsProcessManager {
             netstat_cache: Arc::new(Mutex::new(None)),
             tasklist_cache: Arc::new(Mutex::new(None)),
             auto_restart: Arc::new(RwLock::new(HashMap::new())),
+            watchdog_gen: Arc::new(RwLock::new(HashMap::new())),
+            watchdog_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             reporter: Arc::new(std::sync::Mutex::new(None)),
         }
     }
@@ -98,10 +109,23 @@ impl WindowsProcessManager {
     /// Spawn a background task that monitors a PHP process and restarts it if it dies.
     async fn spawn_watchdog(&self, instance: &ServiceInstance) {
         let id = instance.id();
-        self.auto_restart.write().await.insert(id, true);
+        self.auto_restart.write().await.insert(id.clone(), true);
+        // 抢一个新 gen，旧 watchdog（如果还在 sleep 中）醒来发现 gen 不匹配立即 break。
+        let my_gen = {
+            let mut g = self.watchdog_gen.write().await;
+            let n = g.entry(id.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        // 立即 abort 已存在的旧 watchdog task handle，不靠 sleep 醒来才退。
+        // 不等 await：abort 是 fire-and-forget，旧 task 下一个 await point 触发 cancel。
+        if let Some(old) = self.watchdog_handles.lock().await.remove(&id) {
+            old.abort();
+        }
 
         let processes = self.processes.clone();
         let auto_restart = self.auto_restart.clone();
+        let watchdog_gen = self.watchdog_gen.clone();
         let status_cache = self.status_cache.clone();
         let netstat_cache = self.netstat_cache.clone();
         let reporter_holder = self.reporter.clone();
@@ -109,7 +133,7 @@ impl WindowsProcessManager {
 
         let svc_label = format!("{} {}", inst.kind.display_name(), inst.version);
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             // 上报辅助：每次读最新 reporter，没注入就 no-op
             let report = |level: LogLevel, msg: String, details: Option<String>| {
                 let holder = reporter_holder.clone();
@@ -125,6 +149,20 @@ impl WindowsProcessManager {
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
 
+                // 我已被新 watchdog 替换 / 或 stop 调高了 gen → 我让位退出。
+                // 这条检查必须在 auto_restart 检查之前：stop 后立刻 start，auto_restart 又被
+                // 设回 true 但 gen 已 +1，我看到 gen 不匹配应该退（不然就是两个 watchdog）
+                let cur_gen = watchdog_gen.read().await.get(&inst.id()).copied().unwrap_or(0);
+                if cur_gen != my_gen {
+                    tracing::debug!(
+                        service = %inst.kind.display_name(),
+                        version = %inst.version,
+                        my_gen, cur_gen,
+                        "watchdog 退役（有新一代接管）"
+                    );
+                    break;
+                }
+
                 // User stopped the service → exit watchdog
                 if !auto_restart
                     .read()
@@ -136,12 +174,21 @@ impl WindowsProcessManager {
                     break;
                 }
 
-                // 活检：先看端口有没有人在监听；再校验监听的 PID 跟我们记的一致。
-                // 不校验 PID 的话，端口被其他外部进程占了 watchdog 会误判 alive，
-                // 实际 PHP-CGI 已经死了 nginx 还在 502。
-                let our_pid = processes.read().await.get(&inst.id()).map(|p| p.pid).unwrap_or(0);
+                // 活检要满足两个条件，缺一不可：
+                //   1. PID 校验：netstat 看 LISTENING 的 PID 跟我们记的一致（防外部进程占端口误判）
+                //   2. TCP 探针：socket 真的能 accept 新连接（防 PHP-CGI 进程僵尸 —— socket 还
+                //      listen 但 accept queue 挂死、主线程阻塞，nginx fastcgi 一访问就 502 直到
+                //      升仕。status() 一直用 probe_port，watchdog 也得对齐，不然 UI 说挂了 watchdog 说没事）
+                let our_pid = processes
+                    .read()
+                    .await
+                    .get(&inst.id())
+                    .map(|p| p.root_pid)
+                    .unwrap_or(0);
                 let listening_pid = netstat_snapshot().await.get(&inst.port).copied().unwrap_or(0);
-                let alive = listening_pid != 0 && (our_pid == 0 || listening_pid == our_pid);
+                let pid_ok = php_pool_owns_listener(our_pid, listening_pid, &inst).await;
+                let tcp_ok = pid_ok && probe_port(inst.port).await; // PID 不对就不浪费 connect
+                let alive = pid_ok && tcp_ok;
                 if alive {
                     crashes = 0;
                     continue;
@@ -176,6 +223,26 @@ impl WindowsProcessManager {
                     Some(format!("端口 {}：原 PID={}，当前 LISTENING PID={}", inst.port, our_pid, listening_pid)),
                 ).await;
 
+                // 僵尸 PHP-CGI 场景：进程还在 LISTEN 但 accept 挂死（TCP probe 失败但 PID
+                // 还匹配）。新进程 spawn 会 bind 失败，必须先杀掉旧 PID 释放端口。
+                let zombie_pid = (our_pid != 0).then_some(our_pid);
+                if let Some(pid_to_kill) = zombie_pid {
+                    let mut kill = Command::new("taskkill");
+                    kill.args(["/F", "/T", "/PID"]).arg(pid_to_kill.to_string());
+                    kill.no_window();
+                    let _ = kill.output().await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                // The root may already be gone while inherited workers keep the
+                // listening socket alive. Clear those remnants before binding
+                // a replacement pool.
+                if probe_port(inst.port).await {
+                    let killed = kill_workers_under_install_path(&inst).await;
+                    if killed > 0 {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+
                 match Self::build_start_command(&inst) {
                     Ok(mut cmd) => {
                         cmd.no_window();
@@ -196,7 +263,7 @@ impl WindowsProcessManager {
                                 processes
                                     .write()
                                     .await
-                                    .insert(inst.id(), ProcessInfo { pid: new_pid });
+                                    .insert(inst.id(), ProcessInfo { root_pid: new_pid });
                                 *netstat_cache.lock().await = None;
                                 status_cache.write().await.remove(&inst.id());
                                 tracing::info!(
@@ -234,6 +301,9 @@ impl WindowsProcessManager {
                 tokio::time::sleep(Duration::from_secs(2u64.pow(crashes.min(5)))).await;
             }
         });
+
+        // 把新 handle 存起来，下次 spawn_watchdog / stop 时能 abort 它
+        self.watchdog_handles.lock().await.insert(id, handle);
     }
 
     fn build_start_command(instance: &ServiceInstance) -> Result<Command> {
@@ -266,6 +336,14 @@ impl WindowsProcessManager {
                 let exe = install_path.join("php-cgi.exe");
                 let bind = format!("127.0.0.1:{}", instance.port);
                 let mut cmd = Command::new(&exe);
+                let runtime = instance.php_runtime.as_ref();
+                let workers = runtime.map(|r| r.workers).unwrap_or(1).clamp(1, 16);
+                let max_requests = runtime
+                    .map(|r| r.max_requests)
+                    .unwrap_or(1000)
+                    .clamp(100, 10_000);
+                cmd.env("PHP_FCGI_CHILDREN", workers.to_string());
+                cmd.env("PHP_FCGI_MAX_REQUESTS", max_requests.to_string());
                 cmd.arg("-b").arg(&bind);
                 if let Some(conf) = &instance.config_path {
                     cmd.arg("-c").arg(conf);
@@ -345,7 +423,19 @@ impl WindowsProcessManager {
             ServiceKind::Mysql => {
                 let exe = install_path.join("bin").join("mysqladmin.exe");
                 let mut cmd = Command::new(&exe);
-                cmd.arg("-u").arg("root").arg("shutdown");
+                let password = crate::package::tool_detect::read_mysql_root_password(install_path);
+                if !password.is_empty() {
+                    // 避免把密码放进命令行（会被任务管理器/进程扫描看到）。
+                    cmd.env("MYSQL_PWD", password);
+                }
+                cmd.args([
+                    "--protocol=tcp",
+                    "--host=127.0.0.1",
+                    &format!("--port={}", instance.port),
+                    "--connect-timeout=2",
+                    "--user=root",
+                    "shutdown",
+                ]);
                 cmd.current_dir(install_path);
                 Some(cmd)
             }
@@ -365,10 +455,19 @@ impl WindowsProcessManager {
         // 2) 决定 PID：优先自己启动的；否则从 netstat snapshot 反查
         let pid = {
             let procs = self.processes.read().await;
-            procs.get(&instance.id()).map(|info| info.pid)
+            procs.get(&instance.id()).map(|info| info.root_pid)
         };
         let pid = match pid {
-            Some(p) => p,
+            Some(p) => {
+                if instance.kind == ServiceKind::Php {
+                    let snapshot = self.snapshot_listening_ports().await;
+                    let listener = snapshot.get(&instance.port).copied().unwrap_or(0);
+                    if !php_pool_owns_listener(p, listener, instance).await {
+                        return ServiceStatus::Stopped;
+                    }
+                }
+                p
+            }
             None => {
                 let snapshot = self.snapshot_listening_ports().await;
                 let p = snapshot.get(&instance.port).copied().unwrap_or(0);
@@ -479,61 +578,92 @@ impl ProcessManager for WindowsProcessManager {
             "start: spawn 完成"
         );
 
-        // For short-lived processes (Nginx/Apache may exit quickly on config error),
-        // wait briefly and check if process is still alive。500ms 是固定兜底，配置错误时
-        // 进程会在这段时间内退出（nginx 进程通常 < 100ms 自检完）。
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // Check if process exited immediately (config error etc.)
-        match child.try_wait() {
-            Ok(Some(status)) if !status.success() => {
-                // 同时读 stdout 和 stderr —— Redis on Windows 把 fatal 打到 stdout
-                use tokio::io::AsyncReadExt;
-                let mut stderr_buf = String::new();
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr_buf).await;
-                }
-                let mut stdout_buf = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout_buf).await;
-                }
-                let combined = format!("{}\n{}", stderr_buf.trim(), stdout_buf.trim());
-                let combined = combined.trim();
-                let code = status.code().unwrap_or(-1);
-                let msg = if combined.is_empty() {
-                    // stderr/stdout 都空时，退回去补一次端口探测，给个更有信息量的根因
-                    let snap = self.snapshot_listening_ports().await;
-                    if let Some(&p) = snap.get(&instance.port) {
-                        if p != 0 && !pid_matches_instance(p, instance).await {
-                            let exe = get_process_exe_path(p).await.unwrap_or_default();
-                            format!(
-                                "{} 启动失败 (exit code {})：端口 {} 已被外部进程占用 (PID {}, {})",
-                                instance.kind.display_name(),
-                                code,
-                                instance.port,
-                                p,
-                                exe
-                            )
+        // 自适应等待：端口一旦可连接立即返回，不再让每个服务无条件睡 500ms。
+        // 同时持续检查早退状态，保留原有的配置错误诊断。
+        let ready_started = std::time::Instant::now();
+        let ready_timeout = std::time::Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if !status.success() => {
+                    // 同时读 stdout 和 stderr —— Redis on Windows 把 fatal 打到 stdout
+                    use tokio::io::AsyncReadExt;
+                    let mut stderr_buf = String::new();
+                    if let Some(mut err) = child.stderr.take() {
+                        let _ = err.read_to_string(&mut stderr_buf).await;
+                    }
+                    let mut stdout_buf = String::new();
+                    if let Some(mut out) = child.stdout.take() {
+                        let _ = out.read_to_string(&mut stdout_buf).await;
+                    }
+                    let combined = format!("{}\n{}", stderr_buf.trim(), stdout_buf.trim());
+                    let combined = combined.trim();
+                    let code = status.code().unwrap_or(-1);
+                    let msg = if combined.is_empty() {
+                        // stderr/stdout 都空时，退回去补一次端口探测，给个更有信息量的根因
+                        let snap = self.snapshot_listening_ports().await;
+                        if let Some(&p) = snap.get(&instance.port) {
+                            if p != 0 && !pid_matches_instance(p, instance).await {
+                                let exe = get_process_exe_path(p).await.unwrap_or_default();
+                                format!(
+                                    "{} 启动失败 (exit code {})：端口 {} 已被外部进程占用 (PID {}, {})",
+                                    instance.kind.display_name(),
+                                    code,
+                                    instance.port,
+                                    p,
+                                    exe
+                                )
+                            } else {
+                                format!(
+                                    "{} 启动失败 (exit code {})",
+                                    instance.kind.display_name(),
+                                    code
+                                )
+                            }
                         } else {
-                            format!("{} 启动失败 (exit code {})", instance.kind.display_name(), code)
+                            format!(
+                                "{} 启动失败 (exit code {})",
+                                instance.kind.display_name(),
+                                code
+                            )
                         }
                     } else {
-                        format!("{} 启动失败 (exit code {})", instance.kind.display_name(), code)
-                    }
-                } else {
-                    format!(
-                        "{} 启动失败: {}",
-                        instance.kind.display_name(),
-                        combined.lines().last().unwrap_or("unknown error")
-                    )
-                };
-                return Err(NaxOneError::Process(msg));
+                        format!(
+                            "{} 启动失败: {}",
+                            instance.kind.display_name(),
+                            combined.lines().last().unwrap_or("unknown error")
+                        )
+                    };
+                    return Err(NaxOneError::Process(msg));
+                }
+                _ => {}
             }
-            _ => {} // Still running or exited successfully
+
+            if probe_port(instance.port).await {
+                break;
+            }
+            if ready_started.elapsed() >= ready_timeout {
+                // 启动失败时回收刚创建的进程树，避免留下“不监听但仍存活”的孤儿。
+                if pid > 0 {
+                    let _ = Command::new("taskkill")
+                        .no_window()
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+                return Err(NaxOneError::Process(format!(
+                    "{} 进程已启动，但端口 {} 在 {}ms 内未就绪",
+                    instance.kind.display_name(),
+                    instance.port,
+                    ready_timeout.as_millis()
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         let mut procs = self.processes.write().await;
-        procs.insert(instance.id(), ProcessInfo { pid });
+        procs.insert(instance.id(), ProcessInfo { root_pid: pid });
         drop(procs);
 
         // 主动失效 status 缓存，下次 status() 重新探测得到 Running
@@ -547,6 +677,8 @@ impl ProcessManager for WindowsProcessManager {
         tracing::info!(
             service = instance.kind.display_name(),
             pid,
+            php_workers = instance.php_runtime.as_ref().map(|r| r.workers),
+            php_max_requests = instance.php_runtime.as_ref().map(|r| r.max_requests),
             total_ms = t_total.elapsed().as_millis() as u64,
             "Service started"
         );
@@ -557,6 +689,16 @@ impl ProcessManager for WindowsProcessManager {
     async fn stop(&self, instance: &ServiceInstance) -> Result<()> {
         // Disable auto-restart before stopping (prevents watchdog from immediately respawning)
         self.auto_restart.write().await.remove(&instance.id());
+        // 同步抬一格 gen，下一波 sleep 醒来的旧 watchdog 立即退役，
+        // 避免 stop→2 秒内 start 时旧 watchdog 跟新 watchdog 并存。
+        {
+            let mut g = self.watchdog_gen.write().await;
+            *g.entry(instance.id()).or_insert(0) += 1;
+        }
+        // 立刻 abort handle，不等 sleep 醒来（双保险，避免 sleep 期间 race 雪崩）
+        if let Some(old) = self.watchdog_handles.lock().await.remove(&instance.id()) {
+            old.abort();
+        }
 
         // Try graceful stop command first (nginx -s quit, httpd -k stop, redis-cli shutdown)
         let mut graceful_ok = false;
@@ -579,14 +721,14 @@ impl ProcessManager for WindowsProcessManager {
             }
         }
 
-        // 优雅命令成功时给进程时间退出，避免接下去 taskkill 撞上"刚退出"的竞态。
-        // 端口释放即视为成功，无需再 taskkill。最长等约 3s。
+        // 优雅命令成功时等待端口释放。先立即探测，再以 50ms 间隔轮询；
+        // 保留 3s 上限，但去掉原先每次至少多等 150ms 的阶梯延迟。
         if graceful_ok {
-            for _ in 0..20 {
-                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            for _ in 0..60 {
                 if !probe_port(instance.port).await {
                     break;
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
 
@@ -595,7 +737,7 @@ impl ProcessManager for WindowsProcessManager {
             let pid = {
                 let procs = self.processes.read().await;
                 if let Some(info) = procs.get(&instance.id()) {
-                    info.pid
+                    info.root_pid
                 } else {
                     find_pid_by_port(instance.port).await
                 }
@@ -604,7 +746,7 @@ impl ProcessManager for WindowsProcessManager {
             if pid > 0 {
                 let kill = Command::new("taskkill")
                     .no_window()
-                    .args(["/F", "/PID", &pid.to_string()])
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
                     .output()
@@ -641,8 +783,14 @@ impl ProcessManager for WindowsProcessManager {
             }
         }
 
-        // 最后确认端口真的释放了（覆盖 pid=0 但端口仍被占用的情况，例如多个同类残留进程）
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // 最后确认端口真的释放了。taskkill 返回后通常已经释放，立即探测即可；
+        // 最多补等 200ms 处理极短的内核 socket 清理窗口。
+        for _ in 0..10 {
+            if !probe_port(instance.port).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         if probe_port(instance.port).await {
             // 兜底：把所有 install_path 下的同 exe 名进程一起清掉
             // （nginx master 死了 worker 还活着、apache 服务进程残留 等场景）
@@ -654,7 +802,12 @@ impl ProcessManager for WindowsProcessManager {
                     killed,
                     "兜底清理 install_path 下的残留进程"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                for _ in 0..15 {
+                    if !probe_port(instance.port).await {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
             }
 
             // 再探一次，仍占用才真错
@@ -836,11 +989,15 @@ impl ProcessManager for WindowsProcessManager {
             return Ok(false);
         }
 
+        let root_pid = find_php_pool_root(listening_pid, instance)
+            .await
+            .unwrap_or(listening_pid);
+
         // 通过校验 → 认领
         self.processes
             .write()
             .await
-            .insert(instance.id(), ProcessInfo { pid: listening_pid });
+            .insert(instance.id(), ProcessInfo { root_pid });
         self.spawn_watchdog(instance).await;
 
         // 上报活动日志
@@ -852,7 +1009,7 @@ impl ProcessManager for WindowsProcessManager {
                     "接管已存在的 {} {}（PID {} 端口 {}），已启动 watchdog 监控",
                     instance.kind.display_name(),
                     instance.version,
-                    listening_pid,
+                    root_pid,
                     instance.port
                 ),
                 None,
@@ -862,12 +1019,115 @@ impl ProcessManager for WindowsProcessManager {
         tracing::info!(
             service = %instance.kind.display_name(),
             version = %instance.version,
-            pid = listening_pid,
+            root_pid,
+            listener_pid = listening_pid,
             port = instance.port,
             "Adopted orphan PHP-CGI"
         );
         Ok(true)
     }
+}
+
+fn sys_process_matches_php_instance(
+    process: &sysinfo::Process,
+    instance: &ServiceInstance,
+) -> bool {
+    let name = process.name().to_string_lossy().to_lowercase();
+    if !name.contains("php-cgi") {
+        return false;
+    }
+    let Some(exe) = process.exe() else {
+        return false;
+    };
+    let exe = exe.to_string_lossy().replace('/', "\\").to_lowercase();
+    let install = instance
+        .install_path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_lowercase();
+    if install.is_empty() {
+        return false;
+    }
+    let prefix = if install.ends_with('\\') {
+        install
+    } else {
+        format!("{}\\", install)
+    };
+    exe.starts_with(&prefix)
+}
+
+/// A Windows PHP FastCGI pool may expose the listening socket from a child
+/// process. Treat that child as healthy only when both it and the recorded root
+/// belong to this PHP install and the listener descends from the root.
+async fn php_pool_owns_listener(
+    root_pid: u32,
+    listener_pid: u32,
+    instance: &ServiceInstance,
+) -> bool {
+    if root_pid == 0 || listener_pid == 0 {
+        return false;
+    }
+    use sysinfo::{Pid, ProcessesToUpdate};
+    let root = Pid::from_u32(root_pid);
+    let listener = Pid::from_u32(listener_pid);
+    let mut sys = SYS.lock().await;
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let Some(root_process) = sys.process(root) else {
+        return false;
+    };
+    let Some(listener_process) = sys.process(listener) else {
+        return false;
+    };
+    if !sys_process_matches_php_instance(root_process, instance)
+        || !sys_process_matches_php_instance(listener_process, instance)
+    {
+        return false;
+    }
+
+    let mut current = listener;
+    for _ in 0..64 {
+        if current == root {
+            return true;
+        }
+        let Some(parent) = sys.process(current).and_then(|process| process.parent()) else {
+            return false;
+        };
+        current = parent;
+    }
+    false
+}
+
+/// Walk from a listening PHP worker to the top-most php-cgi parent that belongs
+/// to the same install directory.
+async fn find_php_pool_root(
+    listener_pid: u32,
+    instance: &ServiceInstance,
+) -> Option<u32> {
+    if listener_pid == 0 {
+        return None;
+    }
+    use sysinfo::{Pid, ProcessesToUpdate};
+    let mut sys = SYS.lock().await;
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let mut current = Pid::from_u32(listener_pid);
+    if !sys_process_matches_php_instance(sys.process(current)?, instance) {
+        return None;
+    }
+    for _ in 0..64 {
+        let Some(parent) = sys.process(current).and_then(|process| process.parent()) else {
+            break;
+        };
+        let Some(parent_process) = sys.process(parent) else {
+            break;
+        };
+        if !sys_process_matches_php_instance(parent_process, instance) {
+            break;
+        }
+        current = parent;
+    }
+    Some(current.as_u32())
 }
 
 /// Quick TCP port probe with 300ms timeout
@@ -1114,7 +1374,7 @@ async fn kill_workers_under_install_path(instance: &ServiceInstance) -> usize {
         }
         let kill = Command::new("taskkill")
             .no_window()
-            .args(["/F", "/PID", &pid.to_string()])
+            .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()

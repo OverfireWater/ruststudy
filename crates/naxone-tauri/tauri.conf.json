@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-utils/schema.json",
   "productName": "NaxOne",
-  "version": "0.5.25",
+  "version": "0.5.26",
   "identifier": "com.naxone.app",
   "build": {
     "frontendDist": "./frontend/dist",
@@ -31,7 +31,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "app"],
-    "resources": ["resources/pie.phar"],
+    "resources": ["resources/pie.phar", "resources/cacert.pem"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

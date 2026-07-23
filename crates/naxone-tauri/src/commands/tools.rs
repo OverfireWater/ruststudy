@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::State;
+use tokio::process::Command as TokioCommand;
 
 use crate::commands::logger::logged;
 use crate::state::{resolve_packages_root, AppState};
@@ -60,6 +63,23 @@ pub struct NvmToolInfo {
     pub installed_nodes: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct NodeVersionCatalog {
+    /// Node.js 当前发布线（非 LTS）。
+    pub current: Vec<String>,
+    /// Node.js 长期支持发布线。
+    pub lts: Vec<String>,
+}
+
+struct NvmCommandContext {
+    home: PathBuf,
+    symlink: PathBuf,
+    exe: PathBuf,
+}
+
+/// nvm-windows 会修改共享的 settings、版本目录和 NVM_SYMLINK，所有操作必须串行。
+static NVM_COMMAND_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ─── Commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -89,20 +109,182 @@ pub async fn switch_node_version(
 async fn do_switch_node(version: &str, state: &AppState) -> Result<NvmToolInfo, String> {
     use naxone_adapters::package::tool_detect;
 
-    let nvm_home =
-        tool_detect::get_nvm_home().ok_or_else(|| "NVM_HOME 未设置".to_string())?;
-    let nvm_exe = nvm_home.join("nvm.exe");
-    if !nvm_exe.exists() {
-        return Err("nvm.exe 不存在".into());
+    let _guard = NVM_COMMAND_LOCK.lock().await;
+    let version = tool_detect::normalize_node_version(version)
+        .ok_or_else(|| "Node.js 版本号格式无效，请使用如 22.22.3 的完整版本号".to_string())?;
+    let nvm = resolve_nvm_context()?;
+    if !tool_detect::list_node_versions(&nvm.home).contains(&version) {
+        return Err(format!("Node.js v{} 尚未安装", version));
     }
 
-    tool_detect::switch_node(&nvm_exe, version)?;
+    run_nvm_command(&nvm, &["use", &version], Duration::from_secs(120)).await?;
 
     let config = state.config.read().await;
     let packages_root = resolve_packages_root(&config);
     drop(config);
 
     build_nvm_info(&packages_root).ok_or_else(|| "切换后读取 NVM 信息失败".into())
+}
+
+#[tauri::command]
+pub async fn list_available_node_versions() -> Result<NodeVersionCatalog, String> {
+    use naxone_adapters::package::tool_detect;
+
+    let _guard = NVM_COMMAND_LOCK.lock().await;
+    let nvm = resolve_nvm_context()?;
+    let output =
+        run_nvm_command(&nvm, &["list", "available"], Duration::from_secs(60)).await?;
+    let (current, lts) = tool_detect::parse_available_node_versions(&output);
+    if current.is_empty() && lts.is_empty() {
+        return Err("NVM 未返回可下载的 Node.js 版本，请检查网络或 NVM 代理设置".into());
+    }
+    Ok(NodeVersionCatalog { current, lts })
+}
+
+#[tauri::command]
+pub async fn install_node_version(
+    version: String,
+    activate: bool,
+    state: State<'_, AppState>,
+) -> Result<NvmToolInfo, String> {
+    let normalized = naxone_adapters::package::tool_detect::normalize_node_version(&version)
+        .unwrap_or_else(|| version.trim().to_string());
+    let action = if activate {
+        format!("下载并安装 Node.js v{}，安装后启用", normalized)
+    } else {
+        format!("下载并安装 Node.js v{}", normalized)
+    };
+    let result = do_install_node(&version, activate, &state).await;
+    logged(&state, "tool", action, result).await
+}
+
+async fn do_install_node(
+    version: &str,
+    activate: bool,
+    state: &AppState,
+) -> Result<NvmToolInfo, String> {
+    use naxone_adapters::package::tool_detect;
+
+    let _guard = NVM_COMMAND_LOCK.lock().await;
+    let version = tool_detect::normalize_node_version(version)
+        .ok_or_else(|| "Node.js 版本号格式无效，请使用如 22.22.3 的完整版本号".to_string())?;
+    let nvm = resolve_nvm_context()?;
+    let already_installed = tool_detect::list_node_versions(&nvm.home).contains(&version);
+    if !already_installed {
+        run_nvm_command(
+            &nvm,
+            &["install", &version],
+            Duration::from_secs(15 * 60),
+        )
+        .await?;
+    }
+    if activate {
+        run_nvm_command(&nvm, &["use", &version], Duration::from_secs(120)).await?;
+    }
+
+    let config = state.config.read().await;
+    let packages_root = resolve_packages_root(&config);
+    drop(config);
+    build_nvm_info(&packages_root).ok_or_else(|| "安装后读取 NVM 信息失败".into())
+}
+
+#[tauri::command]
+pub async fn uninstall_node_version(
+    version: String,
+    state: State<'_, AppState>,
+) -> Result<NvmToolInfo, String> {
+    let normalized = naxone_adapters::package::tool_detect::normalize_node_version(&version)
+        .unwrap_or_else(|| version.trim().to_string());
+    let result = do_uninstall_node(&version, &state).await;
+    logged(
+        &state,
+        "tool",
+        format!("卸载 Node.js v{}", normalized),
+        result,
+    )
+    .await
+}
+
+async fn do_uninstall_node(version: &str, state: &AppState) -> Result<NvmToolInfo, String> {
+    use naxone_adapters::package::tool_detect;
+
+    let _guard = NVM_COMMAND_LOCK.lock().await;
+    let version = tool_detect::normalize_node_version(version)
+        .ok_or_else(|| "Node.js 版本号格式无效，请使用如 22.22.3 的完整版本号".to_string())?;
+    let nvm = resolve_nvm_context()?;
+    if !tool_detect::list_node_versions(&nvm.home).contains(&version) {
+        return Err(format!("Node.js v{} 未安装", version));
+    }
+    if tool_detect::get_current_node_version().as_deref() == Some(version.as_str()) {
+        return Err("不能卸载当前正在使用的 Node.js，请先切换到其他版本".into());
+    }
+
+    run_nvm_command(
+        &nvm,
+        &["uninstall", &version],
+        Duration::from_secs(120),
+    )
+    .await?;
+
+    let config = state.config.read().await;
+    let packages_root = resolve_packages_root(&config);
+    drop(config);
+    build_nvm_info(&packages_root).ok_or_else(|| "卸载后读取 NVM 信息失败".into())
+}
+
+fn resolve_nvm_context() -> Result<NvmCommandContext, String> {
+    use naxone_adapters::package::tool_detect;
+
+    let home = tool_detect::get_nvm_home().ok_or_else(|| "NVM_HOME 未设置".to_string())?;
+    let symlink = tool_detect::get_nvm_symlink(&home)
+        .ok_or_else(|| "NVM_SYMLINK 未设置，且 settings.txt 中没有 path 配置".to_string())?;
+    let exe = home.join("nvm.exe");
+    if !exe.is_file() {
+        return Err(format!("nvm.exe 不存在: {}", exe.display()));
+    }
+    Ok(NvmCommandContext { home, symlink, exe })
+}
+
+async fn run_nvm_command(
+    nvm: &NvmCommandContext,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut command = TokioCommand::new(&nvm.exe);
+    command
+        .args(args)
+        .env("NVM_HOME", &nvm.home)
+        .env("NVM_SYMLINK", &nvm.symlink)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| format!("nvm {} 超时", args.join(" ")))?
+        .map_err(|e| format!("启动 nvm {} 失败: {}", args.join(" "), e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let details = if stderr.is_empty() { stdout } else { stderr };
+        return Err(format!(
+            "nvm {} 失败{}",
+            args.join(" "),
+            if details.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", details)
+            }
+        ));
+    }
+    Ok(if stdout.is_empty() { stderr } else { stdout })
 }
 
 #[tauri::command]

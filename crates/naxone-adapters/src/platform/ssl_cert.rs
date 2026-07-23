@@ -21,6 +21,57 @@ use rcgen::{
 const CA_DIR_NAME: &str = "_ca";
 const CA_FILE_STEM: &str = "naxone-rootCA";
 const INSTALLED_STAMP: &str = ".installed";
+pub const CABUNDLE_NAME: &str = "cabundle.pem";
+
+/// 合成 PHP 用的 CA bundle = Mozilla cacert.pem 全集 + NaxOne 本地 CA。
+/// 写入 `<certs_dir>/cabundle.pem`，返回路径供 php.ini 的 curl.cainfo / openssl.cafile 引用。
+///
+/// 幂等：内容没变就不重写（避免 ini 重新指向同样路径时的无意义写）。
+/// 若 NaxOne CA 还没生成（_ca/naxone-rootCA.crt 不存在）→ 返回 Err，调用方决定是否跳过。
+pub fn ensure_cabundle(certs_dir: &Path, bundled_cacert: &Path) -> Result<PathBuf, String> {
+    let ca_cert_path = certs_dir.join(CA_DIR_NAME).join(format!("{}.crt", CA_FILE_STEM));
+    if !ca_cert_path.is_file() {
+        return Err(format!(
+            "NaxOne CA 尚未生成（{} 不存在），请先在任一 vhost 生成 SSL 证书",
+            ca_cert_path.display()
+        ));
+    }
+    if !bundled_cacert.is_file() {
+        return Err(format!(
+            "Mozilla cacert.pem 资源缺失: {}",
+            bundled_cacert.display()
+        ));
+    }
+    std::fs::create_dir_all(certs_dir)
+        .map_err(|e| format!("创建证书目录失败 {}: {}", certs_dir.display(), e))?;
+
+    let base = std::fs::read_to_string(bundled_cacert)
+        .map_err(|e| format!("读 Mozilla cacert.pem 失败: {}", e))?;
+    let ca_pem = std::fs::read_to_string(&ca_cert_path)
+        .map_err(|e| format!("读 NaxOne CA 失败: {}", e))?;
+
+    let mut bundle = String::with_capacity(base.len() + ca_pem.len() + 256);
+    bundle.push_str(&base);
+    if !base.ends_with('\n') {
+        bundle.push('\n');
+    }
+    bundle.push_str("\n# === NaxOne Local Dev CA ===\n");
+    bundle.push_str(&ca_pem);
+    if !ca_pem.ends_with('\n') {
+        bundle.push('\n');
+    }
+
+    let out = certs_dir.join(CABUNDLE_NAME);
+    // 内容一致就跳过写入，避免 ini watcher 误触发
+    if let Ok(existing) = std::fs::read_to_string(&out) {
+        if existing == bundle {
+            return Ok(out);
+        }
+    }
+    std::fs::write(&out, bundle.as_bytes())
+        .map_err(|e| format!("写 cabundle 失败 {}: {}", out.display(), e))?;
+    Ok(out)
+}
 
 /// 给 vhost 生成 leaf 证书。本地 CA 不存在则创建并装进系统信任库。
 /// 返回 (cert_path, key_path)。

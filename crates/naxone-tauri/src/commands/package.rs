@@ -489,6 +489,9 @@ pub async fn install_package(
                     let _ = rescan_services_inner(&state_snap).await;
                     // 主动通知前端刷新，不用等 5s 轮询
                     let _ = app_handle.emit("services-changed", ());
+                    // 装的是 PHP 且 NaxOne CA 已存在 → 注入 cabundle 信任，让新 PHP curl
+                    // 跟其它 PHP 一样能信任本地 dev CA。CA 不存在时函数内部静默跳过。
+                    crate::commands::vhost::refresh_php_cabundle_trust(&app_handle, &state_snap).await;
                 }
                 InstallEvent::Failed {
                     name,

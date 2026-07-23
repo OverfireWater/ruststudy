@@ -20,9 +20,18 @@ impl ServiceManager {
             return Ok(());
         }
         instance.status = ServiceStatus::Starting;
-        let pid = self.process_mgr.start(instance).await?;
-        instance.status = ServiceStatus::Running { pid, memory_mb: None };
-        Ok(())
+        match self.process_mgr.start(instance).await {
+            Ok(pid) => {
+                instance.status = ServiceStatus::Running { pid, memory_mb: None };
+                Ok(())
+            }
+            Err(error) => {
+                instance.status = ServiceStatus::Failed {
+                    reason: error.to_string(),
+                };
+                Err(error)
+            }
+        }
     }
 
     pub async fn stop_service(&self, instance: &mut ServiceInstance) -> Result<()> {
@@ -30,9 +39,18 @@ impl ServiceManager {
             return Ok(());
         }
         instance.status = ServiceStatus::Stopping;
-        self.process_mgr.stop(instance).await?;
-        instance.status = ServiceStatus::Stopped;
-        Ok(())
+        match self.process_mgr.stop(instance).await {
+            Ok(()) => {
+                instance.status = ServiceStatus::Stopped;
+                Ok(())
+            }
+            Err(error) => {
+                instance.status = ServiceStatus::Failed {
+                    reason: error.to_string(),
+                };
+                Err(error)
+            }
+        }
     }
 
     pub async fn restart_service(&self, instance: &mut ServiceInstance) -> Result<()> {
@@ -123,50 +141,51 @@ impl ServiceManager {
             }
         }
 
-        // Start the target service itself
-        self.start_service(target).await?;
-
         // 仅 Nginx 模式需要连带启 PHP-CGI 常驻：fastcgi_pass 必须有进程在 9000+ 监听。
         // Apache 用 mod_fcgid，自己按需 fork php-cgi 子进程，无需主动启动。
-        //
-        // 优化：5 个 PHP 串行启动 = 5 × 500ms（每个 start 的固定 sleep 兜底）= 2.5s 阻塞，
-        // 改用 futures::join 并行 spawn。各 PHP 用独立端口互不影响。
+        // Nginx 与 PHP 使用不同端口，没有“必须先启动 Nginx”的进程依赖，故一起并行启动。
         if target.kind == ServiceKind::Nginx {
-            let php_indices: Vec<usize> = all_services
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.kind == ServiceKind::Php && !s.status.is_running())
-                .map(|(i, _)| i)
-                .collect();
+            let mut jobs: Vec<(Option<usize>, ServiceInstance)> = Vec::new();
+            if !target.status.is_running() {
+                jobs.push((None, target.clone()));
+            }
+            jobs.extend(
+                all_services
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| {
+                        s.kind == ServiceKind::Php
+                            && s.php_runtime.is_some()
+                            && !s.status.is_running()
+                    })
+                    .map(|(i, s)| (Some(i), s.clone())),
+            );
 
-            if !php_indices.is_empty() {
-                let futures = php_indices.iter().map(|&i| {
-                    let svc = &all_services[i];
+            if !jobs.is_empty() {
+                let futures = jobs.into_iter().map(|(index, mut local)| {
                     let pm = self.process_mgr.clone();
                     async move {
-                        let mut local = svc.clone();
+                        let label = format!("{} {}", local.kind.display_name(), local.version);
                         let res = pm.start(&local).await.map(|pid| {
-                            local.status = crate::domain::service::ServiceStatus::Running { pid, memory_mb: None };
+                            local.status = crate::domain::service::ServiceStatus::Running {
+                                pid,
+                                memory_mb: None,
+                            };
                             local
                         });
-                        (i, res)
+                        (index, label, res)
                     }
                 });
                 let results = futures_util::future::join_all(futures).await;
-                // 关键：不再遇错就 return。把所有结果都处理完，成功的写回状态、
-                // 失败的收集到一起。否则一个 PHP 启动失败会让其它已经在跑的 PHP
-                // 的状态没被更新（虽然进程已经 spawn），用户看到的 UI 数据错位。
                 let mut failed: Vec<String> = Vec::new();
-                for (idx, res) in results {
+                for (index, label, res) in results {
                     match res {
-                        Ok(updated) => all_services[idx].status = updated.status,
+                        Ok(updated) => match index {
+                            Some(idx) => all_services[idx].status = updated.status,
+                            None => target.status = updated.status,
+                        },
                         Err(e) => {
-                            failed.push(format!(
-                                "{} {}: {}",
-                                all_services[idx].kind.display_name(),
-                                all_services[idx].version,
-                                e
-                            ));
+                            failed.push(format!("{}: {}", label, e));
                         }
                     }
                 }
@@ -178,6 +197,8 @@ impl ServiceManager {
                     )));
                 }
             }
+        } else {
+            self.start_service(target).await?;
         }
 
         Ok(())
@@ -192,44 +213,208 @@ impl ServiceManager {
         target: &mut ServiceInstance,
         all_services: &mut [ServiceInstance],
     ) -> Result<()> {
-        self.stop_service(target).await?;
+        if target.kind != ServiceKind::Nginx {
+            return self.stop_service(target).await;
+        }
 
-        // 停 nginx 后并行停所有 PHP-CGI（无依赖关系，5 个串行 stop 太慢）。
-        if target.kind == ServiceKind::Nginx {
-            let php_indices: Vec<usize> = all_services
+        // Nginx 与 PHP 没有停止顺序依赖，并行关闭可避免重启时把两段等待相加。
+        let mut jobs: Vec<(Option<usize>, ServiceInstance)> = Vec::new();
+        if target.status.is_running() {
+            jobs.push((None, target.clone()));
+        }
+        jobs.extend(
+            all_services
                 .iter()
                 .enumerate()
                 .filter(|(_, s)| s.kind == ServiceKind::Php && s.status.is_running())
-                .map(|(i, _)| i)
-                .collect();
+                .map(|(i, s)| (Some(i), s.clone())),
+        );
 
-            if !php_indices.is_empty() {
-                let futures = php_indices.iter().map(|&i| {
-                    let svc = all_services[i].clone();
-                    let pm = self.process_mgr.clone();
-                    async move {
-                        let res = pm.stop(&svc).await;
-                        (i, svc.version.clone(), res)
+        let futures = jobs.into_iter().map(|(index, mut local)| {
+            let pm = self.process_mgr.clone();
+            async move {
+                local.status = ServiceStatus::Stopping;
+                let result = pm.stop(&local).await;
+                local.status = match &result {
+                    Ok(()) => ServiceStatus::Stopped,
+                    Err(error) => ServiceStatus::Failed {
+                        reason: error.to_string(),
+                    },
+                };
+                (index, local, result)
+            }
+        });
+
+        let mut target_error = None;
+        for (index, updated, result) in futures_util::future::join_all(futures).await {
+            match index {
+                None => {
+                    target.status = updated.status;
+                    if let Err(error) = result {
+                        target_error = Some(error);
                     }
-                });
-                let results = futures_util::future::join_all(futures).await;
-                for (idx, version, res) in results {
-                    match res {
-                        Ok(_) => {
-                            all_services[idx].status = crate::domain::service::ServiceStatus::Stopped;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                version = %version,
-                                error = %e,
-                                "联动停止 PHP-CGI 失败，继续",
-                            );
-                        }
+                }
+                Some(idx) => {
+                    all_services[idx].status = updated.status;
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            version = %all_services[idx].version,
+                            error = %error,
+                            "联动停止 PHP-CGI 失败，继续",
+                        );
                     }
                 }
             }
         }
 
+        if let Some(error) = target_error {
+            return Err(error);
+        }
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::service::{PhpRuntimeOptions, ServiceOrigin};
+    use crate::ports::process::ProcessManager;
+    use async_trait::async_trait;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct TimedProcessManager {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        next_pid: AtomicU32,
+        fail_start: bool,
+    }
+
+    impl TimedProcessManager {
+        fn new(fail_start: bool) -> Self {
+            Self {
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                next_pid: AtomicU32::new(1000),
+                fail_start,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ProcessManager for TimedProcessManager {
+        async fn start(&self, _instance: &ServiceInstance) -> Result<u32> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            if self.fail_start {
+                Err(NaxOneError::Process("模拟启动失败".into()))
+            } else {
+                Ok(self.next_pid.fetch_add(1, Ordering::SeqCst))
+            }
+        }
+
+        async fn stop(&self, _instance: &ServiceInstance) -> Result<()> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn restart(&self, instance: &ServiceInstance) -> Result<u32> {
+            self.start(instance).await
+        }
+
+        async fn status(&self, instance: &ServiceInstance) -> Result<ServiceStatus> {
+            Ok(instance.status.clone())
+        }
+
+        async fn reload(&self, _instance: &ServiceInstance) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn service(kind: ServiceKind, version: &str, port: u16) -> ServiceInstance {
+        ServiceInstance {
+            kind,
+            version: version.into(),
+            variant: None,
+            install_path: PathBuf::from("D:/test"),
+            config_path: None,
+            port,
+            status: ServiceStatus::Stopped,
+            auto_start: false,
+            origin: ServiceOrigin::Manual,
+            php_runtime: (kind == ServiceKind::Php).then_some(PhpRuntimeOptions {
+                workers: 4,
+                max_requests: 1000,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn nginx_and_php_dependencies_start_in_parallel() {
+        let process = Arc::new(TimedProcessManager::new(false));
+        let manager = ServiceManager::new(process.clone());
+        let mut nginx = service(ServiceKind::Nginx, "1.28.0", 80);
+        let mut others = vec![
+            service(ServiceKind::Php, "8.4.0", 9001),
+            service(ServiceKind::Php, "8.5.0", 9002),
+        ];
+
+        let started = Instant::now();
+        manager
+            .start_with_deps(&mut nginx, &mut others)
+            .await
+            .unwrap();
+
+        assert!(started.elapsed() < Duration::from_millis(180));
+        assert!(process.max_active.load(Ordering::SeqCst) >= 3);
+        assert!(nginx.status.is_running());
+        assert!(others.iter().all(|service| service.status.is_running()));
+    }
+
+    #[tokio::test]
+    async fn failed_start_does_not_leave_starting_status() {
+        let manager = ServiceManager::new(Arc::new(TimedProcessManager::new(true)));
+        let mut redis = service(ServiceKind::Redis, "7.0.0", 6379);
+
+        assert!(manager.start_service(&mut redis).await.is_err());
+        assert!(matches!(redis.status, ServiceStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn nginx_and_php_dependencies_stop_in_parallel() {
+        let process = Arc::new(TimedProcessManager::new(false));
+        let manager = ServiceManager::new(process.clone());
+        let running = |mut service: ServiceInstance, pid| {
+            service.status = ServiceStatus::Running {
+                pid,
+                memory_mb: None,
+            };
+            service
+        };
+        let mut nginx = running(service(ServiceKind::Nginx, "1.28.0", 80), 100);
+        let mut others = vec![
+            running(service(ServiceKind::Php, "8.4.0", 9001), 101),
+            running(service(ServiceKind::Php, "8.5.0", 9002), 102),
+        ];
+
+        let stopped = Instant::now();
+        manager
+            .stop_with_deps(&mut nginx, &mut others)
+            .await
+            .unwrap();
+
+        assert!(stopped.elapsed() < Duration::from_millis(180));
+        assert!(process.max_active.load(Ordering::SeqCst) >= 3);
+        assert_eq!(nginx.status, ServiceStatus::Stopped);
+        assert!(others
+            .iter()
+            .all(|service| service.status == ServiceStatus::Stopped));
     }
 }

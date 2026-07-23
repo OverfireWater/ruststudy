@@ -79,6 +79,13 @@ impl Default for ServiceOrigin {
     }
 }
 
+/// Runtime-only options used when launching a PHP FastCGI pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhpRuntimeOptions {
+    pub workers: u16,
+    pub max_requests: u32,
+}
+
 /// A concrete, runnable service instance
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceInstance {
@@ -93,6 +100,9 @@ pub struct ServiceInstance {
     /// Where this service was found (default = PhpStudy for backward compat)
     #[serde(default)]
     pub origin: ServiceOrigin,
+    /// Set only for PHP versions selected by the active-vhost worker policy.
+    #[serde(default)]
+    pub php_runtime: Option<PhpRuntimeOptions>,
 }
 
 impl ServiceInstance {

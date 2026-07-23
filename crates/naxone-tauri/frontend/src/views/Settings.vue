@@ -11,9 +11,11 @@ interface ConfigDto {
   auto_start: string[]; mysql_port: number; redis_port: number;
   log_dir: string; log_retention_days: number;
   stop_services_on_exit: boolean;
+  phpstudy_compatible_workers: boolean;
+  php_worker_budget: number; php_workers_per_version: number; php_max_requests: number;
 }
 
-const config = ref<ConfigDto>({ phpstudy_path: "", www_root: "", active_web_server: "nginx", auto_start: [], mysql_port: 3306, redis_port: 6379, log_dir: "", log_retention_days: 7, stop_services_on_exit: false });
+const config = ref<ConfigDto>({ phpstudy_path: "", www_root: "", active_web_server: "nginx", auto_start: [], mysql_port: 3306, redis_port: 6379, log_dir: "", log_retention_days: 7, stop_services_on_exit: false, phpstudy_compatible_workers: true, php_worker_budget: 8, php_workers_per_version: 4, php_max_requests: 1000 });
 const busy = ref(false);
 const saved = ref(false);
 const logRetentionOptions = [
@@ -252,6 +254,32 @@ onMounted(() => { loadConfig(); loadCurrentVersion(); });
           <input class="input" type="number" v-model.number="config.redis_port" min="1" max="65535" />
         </div>
       </div>
+    </div>
+
+    <!-- PHP FastCGI -->
+    <div class="card mb-3">
+      <h2 class="text-[16px] font-medium text-content-secondary mb-3">PHP FastCGI 并发</h2>
+      <label class="flex items-center gap-2 text-[16px] cursor-pointer mb-4">
+        <input type="checkbox" v-model="config.phpstudy_compatible_workers" class="accent-accent-success w-4 h-4" />
+        <span>PHPStudy 兼容模式（每个活跃 PHP 版本固定 16 workers）</span>
+      </label>
+      <div class="grid grid-cols-3 gap-4">
+        <div class="flex flex-col gap-1.5">
+          <label class="text-[16px] text-content-secondary font-medium">Worker 总预算</label>
+          <input class="input" type="number" v-model.number="config.php_worker_budget" min="1" max="64" :disabled="config.phpstudy_compatible_workers" />
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label class="text-[16px] text-content-secondary font-medium">单版本上限</label>
+          <input class="input" type="number" v-model.number="config.php_workers_per_version" min="1" max="16" :disabled="config.phpstudy_compatible_workers" />
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label class="text-[16px] text-content-secondary font-medium">最大请求数</label>
+          <input class="input" type="number" v-model.number="config.php_max_requests" min="100" max="10000" step="100" />
+        </div>
+      </div>
+      <p class="text-[13px] text-content-muted mt-2.5">
+        仍然只启动启用站点实际使用的 PHP。关闭兼容模式后，才使用总预算和单版本上限进行加权分配。
+      </p>
     </div>
 
     <!-- Port Diagnosis -->

@@ -18,6 +18,12 @@ interface ServiceInfo {
   origin: string; // "phpstudy" | "store" | "manual"
 }
 
+interface ServiceBatchProgress {
+  operation: "start" | "stop";
+  id: string;
+  status: ServiceInfo["status"];
+}
+
 interface LogEntry {
   id: number; timestamp: string; level: string; category: string;
   message: string; details?: string;
@@ -110,6 +116,7 @@ let logTimer: number | null = null;
 let uptimeTimer: number | null = null;
 let unlistenServicesChanged: UnlistenFn | null = null;
 let unlistenGlobalEnvChanged: UnlistenFn | null = null;
+let unlistenBatchProgress: UnlistenFn | null = null;
 let pauseUntil = 0;
 const INVOKE_TIMEOUT_MS = 10000;
 const bgErrorAt = new Map<string, number>();
@@ -540,6 +547,16 @@ onMounted(async () => {
     loadGlobalPhp();
     loadDevTools();
   });
+  // 批量启动/停止时后端逐服务推送状态，卡片不再等整个批处理结束才变化。
+  unlistenBatchProgress = await listen<ServiceBatchProgress>("service-batch-progress", (event) => {
+    const idx = services.value.findIndex((service) => service.id === event.payload.id);
+    if (idx >= 0) {
+      services.value[idx] = {
+        ...services.value[idx],
+        status: event.payload.status,
+      };
+    }
+  });
   // 轮询从 3s 放宽到 5s（后端已做 status 缓存 + 快速返回 + 后台并行刷新）
   svcTimer = window.setInterval(() => {
     loadServices();
@@ -555,6 +572,7 @@ onUnmounted(() => {
   if (uptimeTimer) clearInterval(uptimeTimer);
   if (unlistenServicesChanged) unlistenServicesChanged();
   if (unlistenGlobalEnvChanged) unlistenGlobalEnvChanged();
+  if (unlistenBatchProgress) unlistenBatchProgress();
 });
 </script>
 
@@ -679,6 +697,9 @@ onUnmounted(() => {
             <div class="text-[16px] transition-colors"
                  :style="{ color: g.running && g.running.id === g.active.id ? 'var(--color-success-light)' : 'var(--text-muted)' }">
               <template v-if="isBusy(g.active.id)">操作中...</template>
+              <template v-else-if="g.active.status.state === 'Starting'">启动中...</template>
+              <template v-else-if="g.active.status.state === 'Stopping'">停止中...</template>
+              <template v-else-if="g.active.status.state === 'Failed'">操作失败</template>
               <template v-else-if="!g.running">已停止</template>
               <template v-else-if="g.running.id === g.active.id">运行中</template>
               <template v-else>v{{ g.running.version }} 运行中</template>

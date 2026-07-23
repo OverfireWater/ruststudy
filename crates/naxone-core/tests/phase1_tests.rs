@@ -174,6 +174,7 @@ fn app_config_toml_roundtrip_with_extras() {
         web_server: Default::default(),
         mysql: Default::default(),
         redis: Default::default(),
+        php_runtime: Default::default(),
         php_instances: Default::default(),
     };
 

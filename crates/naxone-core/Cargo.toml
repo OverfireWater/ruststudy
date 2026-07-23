@@ -14,3 +14,6 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { workspace = true }

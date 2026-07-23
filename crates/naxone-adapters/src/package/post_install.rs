@@ -457,6 +457,94 @@ pub fn ensure_php_ini_extension_dir(install_dir: &Path) -> Result<bool, String> 
     Ok(true)
 }
 
+/// 把 PHP 的 curl.cainfo + openssl.cafile 都指向 NaxOne 的 cabundle.pem。
+/// 这样 PHP curl 跟 file_get_contents("https://...") 都能信任 NaxOne 本地 CA 签的
+/// vhost 证书（浏览器走系统证书库，PHP 走自己的 cacert.pem，两套不通）。
+///
+/// 幂等：已经指到目标路径就不动；指到别的路径会被覆盖（带 .naxone-bak 备份原文件）。
+/// 返回 Ok(true) 表示有修改、Ok(false) 没修改。
+pub fn ensure_php_ini_cabundle(install_dir: &Path, cabundle: &Path) -> Result<bool, String> {
+    let ini_path = install_dir.join("php.ini");
+    if !ini_path.is_file() {
+        return Ok(false); // 没 ini 也没法配，等 ensure_php_ini_extension_dir 先建一份
+    }
+    let original = std::fs::read_to_string(&ini_path)
+        .map_err(|e| format!("读 php.ini 失败: {}", e))?;
+
+    let bundle_str = cabundle.display().to_string();
+    let mut content = set_ini_directive(&original, "curl.cainfo", &bundle_str);
+    content = set_ini_directive(&content, "openssl.cafile", &bundle_str);
+
+    if content == original {
+        return Ok(false);
+    }
+    let bak = ini_path.with_extension("ini.naxone-bak");
+    if !bak.exists() {
+        let _ = std::fs::write(&bak, original.as_bytes());
+    }
+    std::fs::write(&ini_path, content.as_bytes())
+        .map_err(|e| format!("写 php.ini 失败: {}", e))?;
+    tracing::info!(
+        install = %install_dir.display(),
+        cabundle = %bundle_str,
+        "PHP php.ini 已注入 curl.cainfo + openssl.cafile 指向 NaxOne cabundle",
+    );
+    Ok(true)
+}
+
+/// 把 ini 的某个指令设到目标值。规则：
+/// - 已有非注释行 `key = ...` → 覆盖 value（若 value 已是目标值，原样返回）
+/// - 只有注释行 `;key = ...` → 解注释 + 覆盖 value
+/// - 都没有 → 末尾追加 `key = "value"`
+fn set_ini_directive(content: &str, key: &str, value: &str) -> String {
+    let target_line = format!("{} = \"{}\"", key, value);
+    let mut replaced = false;
+
+    let lines: Vec<String> = content
+        .lines()
+        .map(|line| {
+            if replaced {
+                return line.to_string();
+            }
+            let trimmed = line.trim_start();
+            // 已有非注释行
+            if let Some((k, v)) = trimmed.split_once('=') {
+                if !trimmed.starts_with(';') && !trimmed.starts_with('#')
+                    && k.trim().eq_ignore_ascii_case(key)
+                {
+                    // 已经是目标值（去掉两侧引号 + 空白比较），不动
+                    let v_clean = v.trim().trim_matches('"').trim_matches('\'');
+                    if v_clean == value {
+                        replaced = true;
+                        return line.to_string();
+                    }
+                    replaced = true;
+                    return target_line.clone();
+                }
+            }
+            // 注释行
+            if let Some(stripped) = trimmed.strip_prefix(';') {
+                let stripped = stripped.trim_start();
+                if let Some((k, _)) = stripped.split_once('=') {
+                    if k.trim().eq_ignore_ascii_case(key) {
+                        replaced = true;
+                        return target_line.clone();
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+
+    let joined = lines.join("\n");
+    if replaced {
+        joined
+    } else {
+        let sep = if content.is_empty() || content.ends_with('\n') { "" } else { "\n" };
+        format!("{}{}\n; ↓ NaxOne 注入：让 PHP curl / OpenSSL 信任本地 dev CA\n{}\n", content, sep, target_line)
+    }
+}
+
 /// 把 ini 中 `;extension_dir = "ext"` 注释行解开。若找不到这种行，在末尾追加。
 fn enable_extension_dir(content: &str) -> String {
     let mut replaced = false;

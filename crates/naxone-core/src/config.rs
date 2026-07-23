@@ -14,6 +14,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub redis: RedisConfig,
     #[serde(default)]
+    pub php_runtime: PhpRuntimeConfig,
+    #[serde(default)]
     pub php_instances: HashMap<String, PhpInstanceConfig>,
 }
 
@@ -134,17 +136,65 @@ impl Default for RedisConfig {
     }
 }
 
+/// Global PHP FastCGI pool limits.
+///
+/// Workers are distributed only among PHP versions referenced by enabled
+/// vhosts. `total_worker_budget` is therefore a global budget, not a
+/// per-version multiplier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhpRuntimeConfig {
+    /// Match PHPStudy's `1+16` pool: one manager/root plus 16 request workers
+    /// for every PHP version referenced by an enabled vhost.
+    #[serde(default = "default_phpstudy_compatible_workers")]
+    pub phpstudy_compatible_workers: bool,
+    #[serde(default = "default_total_worker_budget")]
+    pub total_worker_budget: u16,
+    #[serde(default = "default_max_workers_per_version")]
+    pub max_workers_per_version: u16,
+    #[serde(default = "default_max_requests")]
+    pub max_requests: u32,
+}
+
+fn default_phpstudy_compatible_workers() -> bool {
+    true
+}
+
+fn default_total_worker_budget() -> u16 {
+    8
+}
+
+fn default_max_workers_per_version() -> u16 {
+    4
+}
+
+fn default_max_requests() -> u32 {
+    1000
+}
+
+impl Default for PhpRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            phpstudy_compatible_workers: default_phpstudy_compatible_workers(),
+            total_worker_budget: default_total_worker_budget(),
+            max_workers_per_version: default_max_workers_per_version(),
+            max_requests: default_max_requests(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhpInstanceConfig {
     pub port: u16,
     #[serde(default = "default_workers")]
     pub workers: u16,
+    #[serde(default = "default_max_requests")]
+    pub max_requests: u32,
     #[serde(default)]
     pub auto_start: bool,
 }
 
 fn default_workers() -> u16 {
-    16
+    4
 }
 
 impl AppConfig {
@@ -210,6 +260,7 @@ impl AppConfig {
             web_server: WebServerConfig::default(),
             mysql: MysqlConfig::default(),
             redis: RedisConfig::default(),
+            php_runtime: PhpRuntimeConfig::default(),
             php_instances: HashMap::new(),
         }
     }

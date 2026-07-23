@@ -65,11 +65,24 @@ pub struct ConfigDto {
     pub extra_install_paths: Vec<ExtraInstallPathDto>,
     #[serde(default)]
     pub stop_services_on_exit: bool,
+    #[serde(default = "default_php_worker_budget")]
+    pub php_worker_budget: u16,
+    #[serde(default = "default_phpstudy_compatible_workers")]
+    pub phpstudy_compatible_workers: bool,
+    #[serde(default = "default_php_workers_per_version")]
+    pub php_workers_per_version: u16,
+    #[serde(default = "default_php_max_requests")]
+    pub php_max_requests: u32,
 }
 
 fn default_retention() -> u32 {
     7
 }
+
+fn default_php_worker_budget() -> u16 { 8 }
+fn default_phpstudy_compatible_workers() -> bool { true }
+fn default_php_workers_per_version() -> u16 { 4 }
+fn default_php_max_requests() -> u32 { 1000 }
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String> {
@@ -100,6 +113,10 @@ pub async fn get_config(state: State<'_, AppState>) -> Result<ConfigDto, String>
             .map(ExtraInstallPathDto::from)
             .collect(),
         stop_services_on_exit: config.general.stop_services_on_exit,
+        php_worker_budget: config.php_runtime.total_worker_budget,
+        phpstudy_compatible_workers: config.php_runtime.phpstudy_compatible_workers,
+        php_workers_per_version: config.php_runtime.max_workers_per_version,
+        php_max_requests: config.php_runtime.max_requests,
     })
 }
 
@@ -109,6 +126,16 @@ pub async fn save_config(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if !(1..=64).contains(&dto.php_worker_budget) {
+        return Err("PHP worker 总预算必须在 1–64 之间".into());
+    }
+    if !(1..=16).contains(&dto.php_workers_per_version) {
+        return Err("单个 PHP 版本 worker 上限必须在 1–16 之间".into());
+    }
+    if !(100..=10_000).contains(&dto.php_max_requests) {
+        return Err("PHP worker 最大请求数必须在 100–10000 之间".into());
+    }
+
     let mut config = state.config.write().await;
 
     // 记录旧的 phpstudy_path，保存后若变化则自动 rescan，避免 services 缓存指向旧路径
@@ -132,6 +159,10 @@ pub async fn save_config(
     };
     config.general.log_retention_days = dto.log_retention_days;
     config.general.stop_services_on_exit = dto.stop_services_on_exit;
+    config.php_runtime.total_worker_budget = dto.php_worker_budget;
+    config.php_runtime.phpstudy_compatible_workers = dto.phpstudy_compatible_workers;
+    config.php_runtime.max_workers_per_version = dto.php_workers_per_version;
+    config.php_runtime.max_requests = dto.php_max_requests;
 
     // Persist to file
     let config_path = crate::state::config_path();
@@ -212,7 +243,7 @@ pub async fn rescan_services(
     drop(config);
 
     let ext_path = phpstudy_opt.as_ref().map(|p| p.join("Extensions"));
-    let new_services = CompositeScanner::scan(
+    let mut new_services = CompositeScanner::scan(
         ext_path.as_deref(),
         Some(&store_ext),
         &extras,
@@ -257,6 +288,12 @@ pub async fn rescan_services(
         Vec::new()
     };
     let merged = VhostManager::merge_vhosts(scanned_vhosts, saved_vhosts);
+    let php_runtime = state.config.read().await.php_runtime.clone();
+    naxone_core::use_cases::php_runtime::apply_php_runtime_policy(
+        &mut new_services,
+        &merged,
+        &php_runtime,
+    );
 
     {
         let mut services = state.services.write().await;
