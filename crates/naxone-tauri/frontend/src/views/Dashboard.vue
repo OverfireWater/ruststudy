@@ -1,5 +1,5 @@
 ﻿<script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, onActivated, onDeactivated } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { AlertCircle, AlertTriangle, CheckCircle2, Info, Bug, ChevronRight, Store, Settings2, RefreshCw } from "lucide-vue-next";
 import { useRouter } from "vue-router";
@@ -256,7 +256,14 @@ async function loadServices(force = false) {
 
 async function loadRecentLogs() {
   try {
-    recentLogs.value = await invokeWithTimeout<LogEntry[]>("get_logs", { limit: 6 });
+    const next = await invokeWithTimeout<LogEntry[]>("get_logs", { limit: 6 });
+    // Avoid replacing the reactive array when the log tail did not change.
+    // This prevents an unnecessary component patch on every polling tick.
+    const currentHead = recentLogs.value[0];
+    const nextHead = next[0];
+    if (next.length !== recentLogs.value.length || currentHead?.id !== nextHead?.id) {
+      recentLogs.value = next;
+    }
   } catch (e) {
     const now = Date.now();
     const last = bgErrorAt.get("recent_logs") ?? 0;
@@ -524,6 +531,23 @@ function levelColor(level: string): string {
   } as Record<string, string>)[level] || "var(--text-muted)";
 }
 
+function stopPolling() {
+  if (svcTimer) { clearInterval(svcTimer); svcTimer = null; }
+  if (logTimer) { clearInterval(logTimer); logTimer = null; }
+  if (uptimeTimer) { clearInterval(uptimeTimer); uptimeTimer = null; }
+}
+
+function startPolling() {
+  if (svcTimer || logTimer || uptimeTimer) return;
+  // Dashboard is kept alive by App.vue. Only poll while its route is active.
+  svcTimer = window.setInterval(() => {
+    loadServices();
+    loadAppStats();  // 顺带刷新本应用内存/运行时长
+  }, 5000);
+  logTimer = window.setInterval(loadRecentLogs, 5000);
+  uptimeTimer = window.setInterval(() => { localUptime.value++; }, 1000);
+}
+
 onMounted(async () => {
   // 立即异步加载，不 await，让 skeleton 先渲染出来
   loadServices(true);
@@ -558,18 +582,18 @@ onMounted(async () => {
     }
   });
   // 轮询从 3s 放宽到 5s（后端已做 status 缓存 + 快速返回 + 后台并行刷新）
-  svcTimer = window.setInterval(() => {
-    loadServices();
-    loadAppStats();  // 顺带刷新本应用内存/运行时长
-  }, 5000);
-  logTimer = window.setInterval(loadRecentLogs, 2000);
-  uptimeTimer = window.setInterval(() => { localUptime.value++; }, 1000);
+  startPolling();
 });
 
+onActivated(() => {
+  startPolling();
+  loadRecentLogs();
+});
+
+onDeactivated(stopPolling);
+
 onUnmounted(() => {
-  if (svcTimer) clearInterval(svcTimer);
-  if (logTimer) clearInterval(logTimer);
-  if (uptimeTimer) clearInterval(uptimeTimer);
+  stopPolling();
   if (unlistenServicesChanged) unlistenServicesChanged();
   if (unlistenGlobalEnvChanged) unlistenGlobalEnvChanged();
   if (unlistenBatchProgress) unlistenBatchProgress();

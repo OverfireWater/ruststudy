@@ -1,8 +1,9 @@
 ﻿<script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, onUnmounted } from "vue";
 import { useRouter, useRoute } from "vue-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 import { LayoutDashboard, Globe, Settings2, Wrench, Store, ChevronLeft, ChevronRight, Minus, Square, X } from "lucide-vue-next";
 import ToastContainer from "./components/ToastContainer.vue";
 import { APP_NAME } from "./composables/useAppInfo";
@@ -13,6 +14,26 @@ const collapsed = ref(false);
 const appWindow = getCurrentWindow();
 const isMaximized = ref(false);
 const appVersion = ref("");
+let unlistenWindowFocus: UnlistenFn | null = null;
+
+function setWindowActivity(active: boolean) {
+  document.documentElement.dataset.windowActive = active ? "true" : "false";
+}
+
+async function syncWindowActivity(focused?: boolean) {
+  try {
+    const visible = await appWindow.isVisible();
+    const hasFocus = focused ?? await appWindow.isFocused();
+    setWindowActivity(visible && hasFocus && document.visibilityState === "visible");
+  } catch {
+    // Keep browser/Vite previews usable when native window APIs are unavailable.
+    setWindowActivity(true);
+  }
+}
+
+function handleDocumentVisibility() {
+  void syncWindowActivity();
+}
 
 function applyTheme(mode: string) {
   if (mode === "auto") {
@@ -24,6 +45,17 @@ function applyTheme(mode: string) {
 }
 
 onMounted(async () => {
+  setWindowActivity(false);
+  document.addEventListener("visibilitychange", handleDocumentVisibility);
+  await syncWindowActivity();
+  try {
+    unlistenWindowFocus = await appWindow.onFocusChanged(({ payload: focused }) => {
+      void syncWindowActivity(focused);
+    });
+  } catch {
+    setWindowActivity(true);
+  }
+
   const saved = localStorage.getItem("naxone-theme") || "light";
   applyTheme(saved);
   window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
@@ -33,6 +65,11 @@ onMounted(async () => {
   try {
     appVersion.value = await invoke<string>("get_app_version");
   } catch { /* 拿不到就不显示，不影响主流程 */ }
+});
+
+onUnmounted(() => {
+  document.removeEventListener("visibilitychange", handleDocumentVisibility);
+  if (unlistenWindowFocus) unlistenWindowFocus();
 });
 
 const menuItems = [
@@ -125,4 +162,3 @@ async function close() { await appWindow.close(); }
     <ToastContainer />
   </div>
 </template>
-

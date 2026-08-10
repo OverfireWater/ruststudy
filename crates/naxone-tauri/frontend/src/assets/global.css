@@ -13,7 +13,9 @@
   --bg-overlay: rgba(15, 23, 42, 0.45);
   --bg-drawer: rgba(248, 250, 254, 0.88);
   --bg-titlebar: transparent;
-  --bg-glass-blur: blur(32px) saturate(180%);
+  /* Keep the glass treatment, but avoid a large 32px backdrop sample on every card. */
+  --bg-glass-blur: blur(16px) saturate(150%);
+  --bg-input-blur: blur(8px) saturate(130%);
   --bg-hover: rgba(15, 23, 42, 0.04);
   --bg-active: rgba(99, 128, 255, 0.10);
   --border-color: rgba(15, 23, 42, 0.08);
@@ -47,7 +49,8 @@
   --bg-overlay: rgba(0, 0, 0, 0.6);
   --bg-drawer: rgba(18, 22, 32, 0.88);
   --bg-titlebar: transparent;
-  --bg-glass-blur: blur(32px) saturate(180%);
+  --bg-glass-blur: blur(16px) saturate(150%);
+  --bg-input-blur: blur(8px) saturate(130%);
   --bg-hover: rgba(255, 255, 255, 0.06);
   --bg-active: rgba(99, 128, 255, 0.18);
   --border-color: rgba(255, 255, 255, 0.10);
@@ -91,7 +94,7 @@
     transition: background var(--transition), color var(--transition);
   }
   body::before {
-    content: ""; position: fixed; inset: -20%; z-index: -2;
+    content: ""; position: fixed; inset: 0; z-index: -2;
     background:
       radial-gradient(45rem 45rem at 12% 18%, rgba(99,128,255,0.55), transparent 60%),
       radial-gradient(40rem 40rem at 88% 12%, rgba(168,85,247,0.50), transparent 60%),
@@ -99,8 +102,10 @@
       radial-gradient(32rem 32rem at 18% 92%, rgba(245,158,11,0.40), transparent 60%),
       radial-gradient(34rem 34rem at 50% 50%, rgba(129,140,248,0.30), transparent 65%),
       radial-gradient(28rem 28rem at 60% 35%, rgba(236,72,153,0.25),  transparent 65%);
-    filter: blur(2px);
+    /* The ambient motion runs only while the native window is focused and visible. */
+    filter: none;
     animation: orb-drift 28s ease-in-out infinite alternate;
+    animation-play-state: paused;
     pointer-events: none;
   }
   body::after {
@@ -156,8 +161,8 @@
     @apply w-full rounded-md outline-none;
     font-size: 16px; padding: 8px 12px;
     background: var(--bg-input);
-    backdrop-filter: blur(12px) saturate(140%);
-    -webkit-backdrop-filter: blur(12px) saturate(140%);
+    backdrop-filter: var(--bg-input-blur);
+    -webkit-backdrop-filter: var(--bg-input-blur);
     border: 1px solid var(--border-color); color: var(--text-primary);
     transition: all var(--transition);
   }
@@ -281,6 +286,21 @@
 
 @layer utilities { .transition-theme { transition: all var(--transition); } }
 
+/* A blurred/composited page should not keep repainting when the window is in the
+   background. The App shell toggles this attribute from Tauri focus/visibility
+   events. Transitions are also disabled so background state updates settle
+   immediately without starting hidden animations. */
+html[data-window-active="true"] body::before {
+  animation-play-state: running;
+}
+
+html[data-window-active="false"] *,
+html[data-window-active="false"] *::before,
+html[data-window-active="false"] *::after {
+  animation-play-state: paused !important;
+  transition: none !important;
+}
+
 /* 全局兜底：inline style 写了 var(--bg-secondary) 的元素一律加毛玻璃。
    放在所有 @layer 之外以获得最高优先级，避免被 Tailwind layer 顺序覆盖。
    用 !important 是因为 inline style 不会写 backdrop-filter，但 layer 规则会被 inline 同属性覆盖；这里非同属性，仅作显式声明。 */
@@ -289,4 +309,3 @@
   backdrop-filter: var(--bg-glass-blur) !important;
   -webkit-backdrop-filter: var(--bg-glass-blur) !important;
 }
-
