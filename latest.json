@@ -1,11 +1,11 @@
 {
-  "version": "v0.5.26",
-  "notes": "## NaxOne v0.5.26\n\n本版集中解决 PHP FastCGI 并发能力与首页服务启停速度，并补齐 NVM 的 Node.js 版本管理功能。\n\n### PHP FastCGI 并发与稳定性\n\n- PHP 服务改为 phpStudy 兼容的多 Worker 模式，兼容模式下每个实际被站点使用的 PHP 版本启动 16 个 Worker，不再由单个 `php-cgi.exe` 串行承接全部请求\n- 未被启用站点引用的 PHP 版本不会自动启动 Worker 池，避免仅仅安装多个版本就产生大量常驻进程\n- 可关闭兼容模式并启用按站点分配的全局 Worker 预算；默认总数 8、单版本上限 4，多版本共享预算\n- Worker 支持请求数上限与自动轮换，默认每个 Worker 处理 1000 个请求后重建\n- 新增 PHP 运行参数配置，可在设置页统一调整兼容模式、总预算、单版本上限和最大请求数\n- 启动、状态检测与停止逻辑可识别整个 PHP Worker 池，减少残留进程和端口误判\n\n### 服务启停提速\n\n- 移除每个服务启动后的固定等待，改为端口就绪自适应检测\n- Nginx 与 PHP 依赖并行启动、并行停止\n- “全部启动”和“全部停止”按依赖分组并发执行，多个 PHP 服务不再逐个等待\n- MySQL 停止优先走管理命令优雅退出，失败时再回退进程终止\n- 首页新增批量启停进度事件，卡片状态会随实际进度即时更新\n\n### NVM / Node.js 版本管理\n\n- 服务配置中可查看 NVM 当前版本、已安装的 Node.js 版本以及可下载版本\n- 支持安装指定 Node.js 版本，并可选择安装后立即切换\n- 支持切换当前 Node.js 版本\n- 支持卸载已安装的 Node.js 版本\n- 支持刷新可下载的 Current / LTS 版本列表，并允许手动输入完整版本号\n- 统一收紧版本输入控件尺寸，避免自定义版本输入框撑高布局\n\n### PHP HTTPS / CA 证书\n\n- 安装包内置 CA bundle\n- PHP 安装和启动迁移时自动配置 `curl.cainfo` 与 `openssl.cafile`\n- 修复部分 PHP 环境中 Composer、cURL 或 HTTPS 请求因缺少根证书而失败的问题\n\n### 其他改进\n\n- 优化服务进程识别、PHP 池监听归属判断和异常状态回写\n- 补充服务并发启动、停止及失败状态恢复测试\n",
-  "pub_date": "2026-07-23T10:03:17Z",
+  "version": "v0.5.27",
+  "notes": "# NaxOne v0.5.27\n\n本版优化窗口动效与后台运行时的 GPU 消耗，同时保留前台使用时的视觉效果。\n\n### GPU 与动效优化\n\n- 窗口处于前台、可见且获得焦点时，继续展示页面动效。\n- 窗口失焦、隐藏、最小化或页面不可见时，暂停 CSS 动画和过渡效果。\n- 应用进入后台时停止 Dashboard 的轮询任务，回到前台后自动恢复。\n- 降低背景模糊半径与背景动画渲染范围，减少 WebView2 合成压力。\n- 减少 Dashboard 日志刷新频率，并避免无变化时重复触发列表渲染。\n",
+  "pub_date": "2026-08-10T15:13:25Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZjRPeTI1Yk4ySDQ5MndPcVFTa3lXR3NERmhKT1RPQm5lRCsxeHVocHc2ZUp4U0F5RW8xaC9DNGlOeUZSbTJrUHh3U3c4TWRDeERqbWxkelZDdk9uSlE0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0ODAwNzYwCWZpbGU6TmF4T25lXzAuNS4yNl94NjQtc2V0dXAuZXhlCmdGTmJGeGZ3dUlteE5DQ2dXNUxjN2c0dzdwbVVrQlVxMWhrUGZGUjYxbVNqa2ZBMHBUMXZYaHlLV2w2bnJMMFVSeFYrdis2WG94bnlmWEh0WlFoL0RnPT0K",
-      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.26/NaxOne_0.5.26_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUSXBZWmVaZ1pMZi8xRWxGTUxQMFRLS2UvNTduK09peG8yQUpMRFpVb3hONUN1MEJ0OWp3eUk2QkVMUlhmUWwwUGlqaElDRVlldjhDbU51NWYrWUl6dHkrTjNNa2NrVHdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2Mzc0ODA1CWZpbGU6TmF4T25lXzAuNS4yN194NjQtc2V0dXAuZXhlCmkxb1gvNGU2WVY2a2NSNE9JTk1SeEJRTVp2MVNpaVp3MlMvQkY1TXU2UHVTbVZWY1hxNXYwWjFRSkEyZWNDRFhPWm91THZ2RlhKREJUMUk1K1g3ckJBPT0K",
+      "url": "https://gitee.com/kz_y/naxone/releases/download/v0.5.27/NaxOne_0.5.27_x64-setup.exe"
     }
   }
 }
